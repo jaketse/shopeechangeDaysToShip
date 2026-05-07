@@ -1,0 +1,518 @@
+﻿<template>
+  <div class="wrap">
+    <aside class="left">
+      <h2>賬戶</h2>
+      <div class="account-actions">
+        <button class="primary" @click="toggleAddForm">{{ showAddForm ? "收起" : "添加賬戶" }}</button>
+      </div>
+
+      <div v-if="showAddForm" class="add-form">
+        <input v-model="newShopId" placeholder="Shop ID" />
+        <textarea v-model="newCookieJson" rows="6" placeholder="Cookie JSON" />
+        <div class="add-row">
+          <button class="primary" @click="addAccount">保存</button>
+          <button @click="toggleAddForm">取消</button>
+        </div>
+      </div>
+
+      <ul class="account-list">
+        <li v-for="a in accounts" :key="a.id" :class="{active: selectedId===a.id}" @click="selectAccount(a.id)">
+          <div class="account-head">
+            <span>{{ a.shop_name || '-' }} (#{{ a.shop_id }})</span>
+            <span v-if="accountBadge(a.id)" class="account-badge">{{ accountBadge(a.id) }}</span>
+          </div>
+          <div class="row">
+            <button @click.stop="validate(a.id)">驗證</button>
+            <button @click.stop="removeAccount(a.id)">刪除</button>
+          </div>
+        </li>
+      </ul>
+    </aside>
+
+    <main class="right">
+      <div v-if="notice.text" :class="['notice', notice.type]">{{ notice.text }}</div>
+      <div v-if="!selectedId" class="empty">
+        <h3>請先選擇賬戶</h3>
+        <p>左側選中已有賬戶，或先點「添加賬戶」。</p>
+      </div>
+
+      <template v-else>
+        <header>
+          <button :class="{activeTab: active==='products'}" @click="active='products'">商品列表</button>
+          <button :class="{activeTab: active==='change'}" @click="active='change'">修改清單</button>
+        </header>
+
+        <section v-if="active==='products'">
+          <div v-if="isAccountRunning(selectedId)" class="progress-wrap">
+            <div class="progress-bar">
+              <div class="progress-fill" :style="{ width: `${productProgressPercent}%` }"></div>
+            </div>
+            <span>{{ productProgressText || '拉取任務進行中...' }}</span>
+          </div>
+          <div class="toolbar">
+            <button :disabled="isAccountRunning(selectedId)" @click="fetchProducts">拉取商品</button>
+            <button @click="loadProducts">刷新</button>
+            <button @click="addCheckedToChangeList" :disabled="checked.size===0">加入修改清單</button>
+          </div>
+          <div class="toolbar">
+            <input v-model.trim="productFilter" placeholder="搜尋 ID / 名稱" />
+            <label class="inline"><input type="checkbox" v-model="onlyStale" /> 只看 Latest=N</label>
+            <select v-model="productSortKey">
+              <option value="product_id">排序: ID</option>
+              <option value="name">排序: 名稱</option>
+              <option value="days_to_ship">排序: DaysToShip</option>
+              <option value="stock">排序: 庫存</option>
+            </select>
+            <select v-model="productSortDir">
+              <option value="desc">降序</option>
+              <option value="asc">升序</option>
+            </select>
+            <select v-model.number="productPageSize">
+              <option :value="20">20 / 頁</option>
+              <option :value="50">50 / 頁</option>
+              <option :value="100">100 / 頁</option>
+            </select>
+          </div>
+          <table>
+            <thead><tr><th></th><th>ID</th><th>Name</th><th>DTS</th><th>Latest</th><th>在修改清單</th></tr></thead>
+            <tbody>
+              <tr v-for="p in pagedProducts" :key="p.product_id" :class="{ stale: !p.exists_in_latest }">
+                <td><input type="checkbox" :checked="checked.has(p.product_id)" @change="toggleCheck(p.product_id, $event.target.checked)" /></td>
+                <td>{{ p.product_id }}</td><td>{{ p.name }}</td><td>{{ p.days_to_ship }}</td><td>{{ p.exists_in_latest ? 'Y' : 'N' }}</td><td>{{ p.in_change_list ? 'Y' : 'N' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="pager">
+            <button @click="productPage = 1" :disabled="productPage<=1">首頁</button>
+            <button @click="productPage -= 1" :disabled="productPage<=1">上一頁</button>
+            <span>第 {{ productPage }} / {{ productTotalPages }} 頁（共 {{ filteredProducts.length }} 筆）</span>
+            <button @click="productPage += 1" :disabled="productPage>=productTotalPages">下一頁</button>
+            <button @click="productPage = productTotalPages" :disabled="productPage>=productTotalPages">末頁</button>
+          </div>
+          <LogPanel :logs="productLogs" />
+        </section>
+
+        <section v-else>
+          <div v-if="isAccountRunning(selectedId)" class="progress-wrap">
+            <div class="progress-bar">
+              <div class="progress-fill" :style="{ width: `${changeProgressPercent}%` }"></div>
+            </div>
+            <span>{{ changeProgressText || '批量修改進行中...' }}</span>
+          </div>
+          <div class="toolbar">
+            <input v-model.number="newDays" type="number" min="0" max="30" />
+            <button :disabled="isAccountRunning(selectedId)" @click="batchChange">批量修改</button>
+            <button @click="loadChangeList">刷新</button>
+            <select v-model.number="changePageSize">
+              <option :value="20">20 / 頁</option>
+              <option :value="50">50 / 頁</option>
+              <option :value="100">100 / 頁</option>
+            </select>
+          </div>
+          <table>
+            <thead><tr><th></th><th>ID</th><th>Name</th><th>DTS</th></tr></thead>
+            <tbody>
+              <tr v-for="p in pagedChangeList" :key="p.product_id"><td><input type="checkbox" :checked="checkedChange.has(p.product_id)" @change="toggleChange(p.product_id, $event.target.checked)" /></td><td>{{ p.product_id }}</td><td>{{ p.name }}</td><td>{{ p.days_to_ship }}</td></tr>
+            </tbody>
+          </table>
+          <div class="pager">
+            <button @click="changePage = 1" :disabled="changePage<=1">首頁</button>
+            <button @click="changePage -= 1" :disabled="changePage<=1">上一頁</button>
+            <span>第 {{ changePage }} / {{ changeTotalPages }} 頁（共 {{ changeList.length }} 筆）</span>
+            <button @click="changePage += 1" :disabled="changePage>=changeTotalPages">下一頁</button>
+            <button @click="changePage = changeTotalPages" :disabled="changePage>=changeTotalPages">末頁</button>
+          </div>
+          <div class="hint">批量修改會作用於整個「修改清單」(共 {{ changeList.length }} 筆)，勾選僅用於移除。</div>
+          <button @click="removeCheckedFromChangeList" :disabled="checkedChange.size===0 || isAccountRunning(selectedId)">移除選中</button>
+          <LogPanel :logs="changeLogs" />
+        </section>
+      </template>
+    </main>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, reactive, defineComponent, h, computed, watch } from 'vue';
+
+const accounts = ref([]);
+const selectedId = ref(null);
+const active = ref('products');
+const products = ref([]);
+const changeList = ref([]);
+const productLogs = ref([]);
+const changeLogs = ref([]);
+const showAddForm = ref(false);
+const newShopId = ref('');
+const newCookieJson = ref('');
+const newDays = ref(2);
+const checked = reactive(new Set());
+const checkedChange = reactive(new Set());
+const notice = ref({ text: '', type: 'error' });
+let noticeTimer = null;
+let logsTimer = null;
+let refreshingProducts = false;
+const runningByAccount = reactive({});
+const activeTaskAccounts = reactive(new Set());
+const productProgressPercent = ref(0);
+const changeProgressPercent = ref(0);
+const productProgressText = ref('');
+const changeProgressText = ref('');
+const accountProgressMap = reactive({});
+const productFilter = ref('');
+const onlyStale = ref(false);
+const productSortKey = ref('product_id');
+const productSortDir = ref('desc');
+const productPage = ref(1);
+const productPageSize = ref(20);
+const changePage = ref(1);
+const changePageSize = ref(20);
+
+const filteredProducts = computed(() => {
+  const keyword = productFilter.value.toLowerCase();
+  const list = products.value.filter((p) => {
+    if (onlyStale.value && p.exists_in_latest) return false;
+    if (!keyword) return true;
+    return String(p.product_id).includes(keyword) || String(p.name || '').toLowerCase().includes(keyword);
+  });
+  const dir = productSortDir.value === 'asc' ? 1 : -1;
+  const key = productSortKey.value;
+  list.sort((a, b) => {
+    const av = a?.[key];
+    const bv = b?.[key];
+    if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
+    return String(av ?? '').localeCompare(String(bv ?? ''), 'zh-Hant') * dir;
+  });
+  return list;
+});
+const productTotalPages = computed(() => Math.max(1, Math.ceil(filteredProducts.value.length / productPageSize.value)));
+const pagedProducts = computed(() => {
+  const start = (productPage.value - 1) * productPageSize.value;
+  return filteredProducts.value.slice(start, start + productPageSize.value);
+});
+const changeTotalPages = computed(() => Math.max(1, Math.ceil(changeList.value.length / changePageSize.value)));
+const pagedChangeList = computed(() => {
+  const start = (changePage.value - 1) * changePageSize.value;
+  return changeList.value.slice(start, start + changePageSize.value);
+});
+
+watch([filteredProducts, productPageSize], () => {
+  if (productPage.value > productTotalPages.value) productPage.value = productTotalPages.value;
+  if (productPage.value < 1) productPage.value = 1;
+});
+watch([productFilter, onlyStale, productSortKey, productSortDir], () => {
+  productPage.value = 1;
+});
+watch([changeList, changePageSize], () => {
+  if (changePage.value > changeTotalPages.value) changePage.value = changeTotalPages.value;
+  if (changePage.value < 1) changePage.value = 1;
+});
+const getApi = () => {
+  if (!window.api) {
+    throw new Error('未連接桌面端 API，請用 Electron App 打開，不要只開瀏覽器頁面。');
+  }
+  return window.api;
+};
+function showNotice(text, type = 'error') {
+  notice.value = { text: String(text || ''), type };
+  if (noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { notice.value = { text: '', type: 'error' }; }, 5000);
+}
+function isAccountRunning(accountId) {
+  if (!accountId) return false;
+  return Boolean(runningByAccount[String(accountId)]);
+}
+function getErrMsg(err) {
+  const raw = String(err?.message || err || '');
+  const marker = 'Error invoking remote method';
+  if (!raw.includes(marker)) return raw;
+  const idx = raw.indexOf('Error: ');
+  if (idx >= 0) return raw.slice(idx + 7).trim();
+  return raw;
+}
+
+const LogPanel = defineComponent({
+  props: { logs: { type: Array, required: true } },
+  setup(props) {
+    return () => h('div', { class: 'logs' }, props.logs.map((l) => h('div', { class: `log ${l.type}` }, `[${new Date(l.created_at * 1000).toLocaleString()}] ${l.message}`)));
+  }
+});
+
+async function loadAccounts() { accounts.value = await getApi().getAccounts(); }
+async function loadProducts() { if (selectedId.value) products.value = await getApi().getProducts(selectedId.value); await loadLogs(); }
+async function loadChangeList() { if (selectedId.value) changeList.value = await getApi().getChangeList(selectedId.value); await loadLogs(); }
+async function loadLogs() {
+  if (!selectedId.value) return;
+  productLogs.value = await getApi().getLogs(selectedId.value, 'products');
+  changeLogs.value = await getApi().getLogs(selectedId.value, 'change');
+  parseProgressFromLogs();
+}
+function parseProgressFromLogs() {
+  const pLog = productLogs.value.find((x) => /Progress fetch:/.test(x.message));
+  const dLog = productLogs.value.find((x) => /Progress detail:/.test(x.message));
+  if (dLog) {
+    const m = dLog.message.match(/Progress detail:\s*(\d+\/\d+)\s+success=(\d+)\s+percent=(\d+)/);
+    if (m) {
+      productProgressText.value = `詳情進度 ${m[1]}，成功 ${m[2]}，${m[3]}%`;
+      productProgressPercent.value = Number(m[3]) || 0;
+    }
+  } else if (pLog) {
+    const m = pLog.message.match(/page=(.+?) products=(.+?) percent=(\d+)/);
+    if (m) {
+      productProgressText.value = `拉取進度 ${m[1]}，商品 ${m[2]}，${m[3]}%`;
+      productProgressPercent.value = Number(m[3]) || 0;
+    }
+  }
+  const cLog = changeLogs.value.find((x) => /Progress change:/.test(x.message));
+  if (cLog) {
+    const m = cLog.message.match(/Progress change:\s*(\d+\/\d+)\s+success=(\d+)\s+fail=(\d+)\s+percent=(\d+)/);
+    if (m) {
+      changeProgressText.value = `修改進度 ${m[1]}，成功 ${m[2]}，失敗 ${m[3]}，${m[4]}%`;
+      changeProgressPercent.value = Number(m[4]) || 0;
+    }
+  }
+}
+async function refreshRunningState() {
+  for (const a of accounts.value) {
+    try {
+      runningByAccount[String(a.id)] = await getApi().isTaskRunning(a.id);
+    } catch {}
+  }
+}
+async function refreshAccountBadges() {
+  for (const a of accounts.value) {
+    const id = a.id;
+    const key = String(id);
+    try {
+      const pLogs = await getApi().getLogs(id, 'products');
+      const cLogs = await getApi().getLogs(id, 'change');
+      const p = pLogs.find((x) => /Progress fetch:/.test(x.message));
+      const c = cLogs.find((x) => /Progress change:/.test(x.message));
+      if (runningByAccount[key]) {
+        if (c) {
+          const m = c.message.match(/percent=(\d+)/);
+          accountProgressMap[key] = `改 ${m ? m[1] : 0}%`;
+        } else if (p) {
+          const m = p.message.match(/percent=(\d+)/);
+          accountProgressMap[key] = `拉 ${m ? m[1] : 0}%`;
+        } else {
+          accountProgressMap[key] = '進行中';
+        }
+      } else {
+        accountProgressMap[key] = '';
+      }
+    } catch {}
+  }
+}
+function accountBadge(accountId) {
+  return accountProgressMap[String(accountId)] || '';
+}
+function startLiveLogPolling() {
+  if (logsTimer) return;
+  logsTimer = setInterval(() => {
+    loadLogs().catch(() => {});
+    refreshRunningState().catch(() => {});
+    refreshAccountBadges().catch(() => {});
+    if (!refreshingProducts && selectedId.value && isAccountRunning(selectedId.value) && active.value === 'products') {
+      refreshingProducts = true;
+      getApi().getProducts(selectedId.value)
+        .then((rows) => { products.value = rows; })
+        .catch(() => {})
+        .finally(() => { refreshingProducts = false; });
+    }
+  }, 1000);
+}
+function stopLiveLogPolling() {
+  if (activeTaskAccounts.size > 0) return;
+  if (logsTimer) {
+    clearInterval(logsTimer);
+    logsTimer = null;
+  }
+}
+
+function toggleAddForm() { showAddForm.value = !showAddForm.value; }
+function selectAccount(id) { selectedId.value = id; checked.clear(); checkedChange.clear(); loadProducts(); loadChangeList(); }
+function toggleCheck(id, on) { on ? checked.add(id) : checked.delete(id); }
+function toggleChange(id, on) { on ? checkedChange.add(id) : checkedChange.delete(id); }
+
+async function addAccount() {
+  try {
+    const shopId = Number(String(newShopId.value || '').trim());
+    if (!Number.isInteger(shopId) || shopId <= 0) {
+      throw new Error('Shop ID 必填且必須是正整數');
+    }
+    const cookieText = String(newCookieJson.value || '').trim();
+    if (!cookieText) {
+      throw new Error('Cookie JSON 不能為空');
+    }
+    await getApi().addAccount(shopId, cookieText);
+    newShopId.value = '';
+    newCookieJson.value = '';
+    showAddForm.value = false;
+    await loadAccounts();
+  } catch (e) {
+    showNotice(getErrMsg(e), 'error');
+  }
+}
+
+async function validate(id) {
+  try {
+    await getApi().validateAccount(id);
+    showNotice('賬戶驗證成功', 'success');
+  } catch (e) {
+    showNotice(getErrMsg(e), 'error');
+  }
+}
+async function removeAccount(id) {
+  try {
+    if (selectedId.value === id) stopLiveLogPolling();
+    await getApi().deleteAccount(id);
+    if (selectedId.value === id) selectedId.value = null;
+    await loadAccounts();
+  } catch (e) {
+    showNotice(getErrMsg(e), 'error');
+  }
+}
+
+async function fetchProducts() {
+  const id = selectedId.value;
+  runningByAccount[String(id)] = true;
+  productProgressPercent.value = 0;
+  productProgressText.value = '';
+  activeTaskAccounts.add(String(id));
+  startLiveLogPolling();
+  try {
+    await getApi().fetchProducts(id);
+  } catch (e) {
+    const msg = getErrMsg(e);
+    if (!/page size is exceed limit/i.test(msg)) {
+      showNotice(msg, 'error');
+    }
+  } finally {
+    runningByAccount[String(id)] = false;
+    activeTaskAccounts.delete(String(id));
+    stopLiveLogPolling();
+    if (selectedId.value === id) await loadProducts();
+  }
+}
+
+async function addCheckedToChangeList() {
+  try {
+    const ids = [...new Set([...checked].map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0))];
+    if (ids.length === 0) {
+      showNotice('請先勾選商品', 'error');
+      return;
+    }
+    await getApi().addToChangeList(selectedId.value, ids);
+    checked.clear();
+    showNotice(`已加入修改清單: ${ids.length} 筆`, 'success');
+    await loadProducts();
+    await loadChangeList();
+  } catch (e) {
+    showNotice(getErrMsg(e), 'error');
+  }
+}
+
+async function removeCheckedFromChangeList() {
+  try {
+    const ids = [...new Set([...checkedChange].map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0))];
+    if (ids.length === 0) {
+      showNotice('請先勾選商品', 'error');
+      return;
+    }
+    await getApi().removeFromChangeList(selectedId.value, ids);
+    checkedChange.clear();
+    showNotice(`已移除: ${ids.length} 筆`, 'success');
+    await loadProducts();
+    await loadChangeList();
+  } catch (e) {
+    showNotice(getErrMsg(e), 'error');
+  }
+}
+
+async function batchChange() {
+  const id = selectedId.value;
+  const total = changeList.value.length;
+  const days = Number(newDays.value);
+  if (!Number.isInteger(days) || days < 0 || days > 30) {
+    showNotice('天數必須是 0-30 的整數', 'error');
+    return;
+  }
+  if (total <= 0) {
+    showNotice('修改清單為空，無法批量修改', 'error');
+    return;
+  }
+  const ok = window.confirm(`確認批量修改？\n商品數量：${total}\n修改為：${days} 天`);
+  if (!ok) return;
+
+  runningByAccount[String(id)] = true;
+  changeProgressPercent.value = 0;
+  changeProgressText.value = '';
+  activeTaskAccounts.add(String(id));
+  startLiveLogPolling();
+  try {
+    await getApi().batchChangeDaysToShip(id, days);
+  } catch (e) {
+    showNotice(getErrMsg(e), 'error');
+  } finally {
+    runningByAccount[String(id)] = false;
+    activeTaskAccounts.delete(String(id));
+    stopLiveLogPolling();
+    if (selectedId.value === id) {
+      await loadProducts();
+      await loadChangeList();
+    }
+  }
+}
+
+onMounted(async () => {
+  try {
+    await loadAccounts();
+    await refreshRunningState();
+    await refreshAccountBadges();
+    if (accounts.value.length) selectAccount(accounts.value[0].id);
+  } catch (e) {
+    showNotice(getErrMsg(e), 'error');
+  }
+});
+</script>
+
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:#f5f7fb;color:#1f2a37}
+.wrap{display:grid;grid-template-columns:340px 1fr;height:100vh}
+.left{padding:16px;border-right:1px solid #e5e7eb;overflow:auto;background:#fff}
+.right{padding:16px;overflow:auto}
+h2{margin:0 0 12px}
+.account-actions{margin-bottom:12px}
+.add-form{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#fafafa;margin-bottom:12px}
+.add-row{display:flex;gap:8px}
+input,textarea,button{padding:8px;border:1px solid #d1d5db;border-radius:6px}
+input,textarea{width:100%}
+button{background:#fff;cursor:pointer}
+button.primary{background:#2563eb;color:#fff;border-color:#2563eb}
+.account-list{list-style:none;padding:0;margin:0}
+li{border:1px solid #e5e7eb;padding:10px;margin:8px 0;cursor:pointer;border-radius:8px;background:#fff}
+li.active{background:#eff6ff;border-color:#93c5fd}
+.account-head{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.account-badge{font-size:11px;padding:2px 8px;border-radius:999px;background:#dbeafe;color:#1d4ed8;border:1px solid #93c5fd;white-space:nowrap}
+.row{display:flex;gap:8px;margin-top:8px}
+header{display:flex;gap:8px;margin-bottom:12px}
+.activeTab{background:#111827;color:#fff;border-color:#111827}
+.toolbar{display:flex;gap:8px;margin-bottom:8px}
+.inline{display:flex;align-items:center;gap:6px;font-size:13px}
+table{width:100%;border-collapse:collapse;margin-bottom:8px;background:#fff}
+th,td{border:1px solid #e5e7eb;padding:6px;text-align:left}
+tr.stale{background:#fff2f2}
+.pager{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.pager span{font-size:12px;color:#374151}
+.hint{font-size:12px;color:#6b7280;margin-bottom:8px}
+.logs{border:1px solid #e5e7eb;padding:8px;max-height:180px;overflow:auto;background:#fff}
+.log{font-size:12px;margin:4px 0}.log.error{color:#c00}.log.success{color:#0a7d21}
+.empty{height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center;color:#6b7280}
+.notice{margin-bottom:10px;padding:10px;border-radius:8px;border:1px solid}
+.notice.error{background:#fef2f2;border-color:#fecaca;color:#991b1b}
+.notice.success{background:#ecfdf5;border-color:#a7f3d0;color:#065f46}
+.progress-wrap{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.progress-wrap span{font-size:12px;color:#374151}
+.progress-bar{position:relative;width:220px;height:8px;border-radius:999px;background:#e5e7eb;overflow:hidden}
+.progress-fill{height:100%;background:#2563eb;transition:width .35s ease}
+</style>
