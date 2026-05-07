@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld('api', {
   getChangeList: (accountId) => ipcRenderer.invoke('change-list:get', accountId),
 
   batchChangeDaysToShip: (accountId, days) => ipcRenderer.invoke('change:batch', accountId, days),
-  getLogs: (accountId, tab) => ipcRenderer.invoke('logs:get', accountId, tab),
+  getLogs: (accountId, tab, taskId = null) => ipcRenderer.invoke('logs:get', accountId, tab, taskId),
+  getLogGroups: (accountId, tab) => ipcRenderer.invoke('logs:groups', accountId, tab),
   isTaskRunning: (accountId) => ipcRenderer.invoke('task:running', accountId),
+  stopTask: (accountId) => ipcRenderer.invoke('task:stop', accountId),
 });

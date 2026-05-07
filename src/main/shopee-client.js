@@ -223,16 +223,43 @@ export async function getProductDetail(cookieJSON, productId) {
   return request(c, 'GET', u);
 }
 
-export async function updateDaysToShip(cookieJSON, productId, days) {
+async function getProductInfoById(cookieMap, productId, isDraft = false) {
+  const qs = new URLSearchParams({
+    SPC_CDS: cookieMap.SPC_CDS,
+    SPC_CDS_VER: '2',
+    product_id: String(productId),
+    is_draft: String(Boolean(isDraft)),
+  });
+  const u = `${BASE}/api/v3/product/get_product_info?${qs.toString()}`;
+  const data = await request(cookieMap, 'GET', u);
+  if (data.code !== 0) throw new Error(data.message || data.msg || 'get_product_info failed');
+  return data.data?.product_info || null;
+}
+
+export async function getProductInfo(cookieJSON, productId, isDraft = false) {
+  const c = parseCookieJSON(cookieJSON);
+  return getProductInfoById(c, productId, isDraft);
+}
+
+export async function updateDaysToShip(cookieJSON, productId, days, existingInfo = null) {
   const c = parseCookieJSON(cookieJSON);
   const qs = new URLSearchParams({ SPC_CDS: c.SPC_CDS, SPC_CDS_VER: '2' });
   const u = `${BASE}/api/v3/product/update_product_info?${qs.toString()}`;
+  const info = existingInfo || await getProductInfoById(c, productId, false);
+  if (!info) throw new Error('get_product_info returned empty product_info');
+
+  const basePreOrder = info.pre_order_info || {};
 
   const body = {
     product_id: productId,
     product_info: {
-      enable_model_level_dts: false,
-      pre_order_info: { pre_order: days > 0, days_to_ship: days },
+      enable_model_level_dts: Boolean(info.enable_model_level_dts),
+      description_info: info.description_info,
+      pre_order_info: {
+        ...basePreOrder,
+        pre_order: days > 0,
+        days_to_ship: days,
+      },
     },
     is_draft: false,
   };
