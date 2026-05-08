@@ -1,17 +1,11 @@
-﻿import fs from 'node:fs';
+import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import initSqlJs from 'sql.js';
+import Database from 'better-sqlite3';
 
-const dbPath = path.join(os.homedir(), '.shopee-days-to-ship-electron.db');
+const dbPath = path.join(os.homedir(), '.shopee-days-to-ship-electron.sqlite');
 let db;
-let SQL;
 let txDepth = 0;
-
-function persist() {
-  const data = db.export();
-  fs.writeFileSync(dbPath, Buffer.from(data));
-}
 
 function isWriteSql(sql) {
   return /^\s*(insert|update|delete|create|drop|alter|replace|begin|commit|rollback)/i.test(sql);
@@ -21,42 +15,31 @@ function wrapPrepare(sql) {
   return {
     run: (...params) => {
       const stmt = db.prepare(sql);
-      stmt.bind(params);
-      stmt.step();
-      stmt.free();
-      if (isWriteSql(sql) && txDepth === 0) persist();
-      const idRes = db.exec('SELECT last_insert_rowid() AS id');
-      const lastInsertRowid = idRes?.[0]?.values?.[0]?.[0] ?? 0;
+      const info = stmt.run(...params);
+      const lastInsertRowid = Number(info?.lastInsertRowid || 0);
       return { lastInsertRowid };
     },
     get: (...params) => {
       const stmt = db.prepare(sql);
-      stmt.bind(params);
-      const row = stmt.step() ? stmt.getAsObject() : undefined;
-      stmt.free();
-      return row;
+      return stmt.get(...params);
     },
     all: (...params) => {
       const stmt = db.prepare(sql);
-      stmt.bind(params);
-      const rows = [];
-      while (stmt.step()) rows.push(stmt.getAsObject());
-      stmt.free();
-      return rows;
+      return stmt.all(...params);
     },
   };
 }
 
 export async function initDB() {
   if (db) return;
-  SQL = await initSqlJs({ locateFile: (file) => path.join(process.cwd(), 'node_modules', 'sql.js', 'dist', file) });
-  if (fs.existsSync(dbPath)) {
-    db = new SQL.Database(fs.readFileSync(dbPath));
-  } else {
-    db = new SQL.Database();
-  }
+  const dir = path.dirname(dbPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  db.run(`
+  db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+
+  db.exec(`
     CREATE TABLE IF NOT EXISTS accounts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       shop_id INTEGER NOT NULL UNIQUE,
@@ -113,30 +96,21 @@ export async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_task_queue_account_type_status_created
       ON task_queue(account_id, task_type, status, created_at);
   `);
-  persist();
 }
 
 export const dbApi = {
   prepare: (sql) => wrapPrepare(sql),
   exec: (sql) => {
-    db.run(sql);
-    if (isWriteSql(sql) && txDepth === 0) persist();
+    db.exec(sql);
   },
   transaction: (fn) => (...args) => {
     txDepth += 1;
-    db.run('BEGIN');
     try {
-      fn(...args);
-      db.run('COMMIT');
+      const wrapped = db.transaction(() => fn(...args));
+      wrapped();
       txDepth -= 1;
-      if (txDepth === 0) persist();
     } catch (e) {
       txDepth = Math.max(0, txDepth - 1);
-      try {
-        db.run('ROLLBACK');
-      } catch {
-        // ignore rollback secondary error when transaction already closed
-      }
       throw e;
     }
   },

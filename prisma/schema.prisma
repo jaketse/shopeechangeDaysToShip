@@ -1,0 +1,67 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Account {
+  id         Int      @id @default(autoincrement())
+  shopId     Int      @unique @map("shop_id")
+  shopName   String?  @map("shop_name")
+  cookieJson String   @map("cookie_json")
+  createdAt  Int?     @map("created_at")
+  updatedAt  Int?     @map("updated_at")
+
+  @@map("accounts")
+}
+
+model Product {
+  id             Int     @id @default(autoincrement())
+  accountId      Int     @map("account_id")
+  productId      Int     @map("product_id")
+  name           String?
+  image          String?
+  price          String?
+  stock          Int?
+  daysToShip     Int?    @map("days_to_ship")
+  status         Int?
+  isPreOrder     Int?    @map("is_pre_order")
+  detailJson     String? @map("detail_json")
+  fetchedAt      Int?    @map("fetched_at")
+  inChangeList   Int?    @default(0) @map("in_change_list")
+  existsInLatest Int?    @default(1) @map("exists_in_latest")
+
+  @@unique([accountId, productId])
+  @@index([accountId, inChangeList], map: "idx_products_account_change_list")
+  @@index([accountId, existsInLatest], map: "idx_products_account_latest")
+  @@map("products")
+}
+
+model Log {
+  id        Int     @id @default(autoincrement())
+  accountId Int     @map("account_id")
+  tab       String?
+  message   String?
+  type      String?
+  createdAt Int?    @map("created_at")
+
+  @@index([accountId, tab, createdAt], map: "idx_logs_account_tab_created")
+  @@map("logs")
+}
+
+model TaskQueue {
+  id          Int     @id @default(autoincrement())
+  accountId   Int     @map("account_id")
+  taskType    String  @map("task_type")
+  payloadJson String? @map("payload_json")
+  status      String
+  createdAt   Int?    @map("created_at")
+  updatedAt   Int?    @map("updated_at")
+  lastError   String? @map("last_error")
+
+  @@index([accountId, taskType, status, createdAt], map: "idx_task_queue_account_type_status_created")
+  @@map("task_queue")
+}

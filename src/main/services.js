@@ -152,9 +152,11 @@ async function executeFetchProducts(accountId) {
       } finally {
         detailDone += 1;
         const base = Math.max(expectedTotal, fetchedTotal, detailDone, 1);
-        let percent = Math.min(100, Math.floor((detailDone / base) * 100));
-        if (!listDone && percent >= 100) percent = 99;
-        addLog(accountId, 'products', `Progress detail: ${detailDone}/${base} success=${detailOk} percent=${percent}`);
+        const listNotFinished = !listDone;
+        const displayTotal = listNotFinished && detailDone >= base ? base + 1 : base;
+        let percent = Math.min(100, Math.floor((detailDone / displayTotal) * 100));
+        const statusSuffix = listNotFinished ? ' list=running' : ' list=done';
+        addLog(accountId, 'products', `Progress detail: ${detailDone}/${displayTotal} success=${detailOk} percent=${percent}${statusSuffix}`);
         if (detailDone % 20 === 0) {
           const denom = Math.max(detailOk, 1);
           addLog(
@@ -221,6 +223,7 @@ async function executeFetchProducts(accountId) {
 
   addLog(accountId, 'products', `List phase finished. total=${fetchedTotal}`, 'success');
   await Promise.all(detailWorkers);
+  addLog(accountId, 'products', `Progress detail: ${detailDone}/${Math.max(expectedTotal, fetchedTotal, detailDone)} success=${detailOk} percent=100`);
   addLog(accountId, 'products', `Detail phase finished. success=${detailOk}, total=${Math.max(expectedTotal, fetchedTotal, detailDone)}`, 'success');
   addLog(accountId, 'products', `Fetch finished. total=${fetchedTotal}`, 'success');
   return true;

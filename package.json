@@ -7,17 +7,21 @@
   "scripts": {
     "dev": "concurrently \"vite --config src/renderer/vite.config.js\" \"wait-on tcp:5173 && powershell -NoProfile -Command \\\"$env:ELECTRON_RENDERER_URL='http://127.0.0.1:5173'; $env:ELECTRON_REMOTE_DEBUGGING_PORT='9222'; electron .\\\"\"",
     "build": "vite build --config src/renderer/vite.config.js",
-    "start": "electron ."
+    "start": "electron .",
+    "prisma:generate": "prisma generate",
+    "migrate:legacy": "node scripts/migrate-legacy-db.js"
   },
   "dependencies": {
+    "@prisma/client": "^6.8.2",
+    "better-sqlite3": "^11.10.0",
     "electron": "28.3.3",
     "node-fetch": "^3.3.2",
-    "sql.js": "^1.13.0",
     "vue": "3.4.38"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "4.6.2",
     "concurrently": "7.6.0",
+    "prisma": "^6.8.2",
     "vite": "4.5.14",
     "wait-on": "7.2.0"
   }
