@@ -1,12 +1,16 @@
 {
   "name": "change-days-to-ship-electron",
   "version": "1.0.0",
-  "private": true,
+  "description": "Shopee tool for fetching products and updating days to ship",
+  "author": "xiajaketse",
+  "private": false,
   "type": "module",
   "main": "src/main/main.js",
   "scripts": {
     "dev": "concurrently \"vite --config src/renderer/vite.config.js\" \"wait-on tcp:5173 && powershell -NoProfile -Command \\\"$env:ELECTRON_RENDERER_URL='http://127.0.0.1:5173'; $env:ELECTRON_REMOTE_DEBUGGING_PORT='9222'; electron .\\\"\"",
     "build": "vite build --config src/renderer/vite.config.js",
+    "dist": "npm run build && electron-builder --win nsis",
+    "release": "npm run build && electron-builder --win nsis --publish always",
     "start": "electron .",
     "prisma:generate": "prisma generate",
     "migrate:legacy": "node scripts/migrate-legacy-db.js"
@@ -14,15 +18,69 @@
   "dependencies": {
     "@prisma/client": "^6.8.2",
     "better-sqlite3": "^11.10.0",
-    "electron": "28.3.3",
+    "electron-updater": "^6.8.3",
     "node-fetch": "^3.3.2",
     "vue": "3.4.38"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "4.6.2",
     "concurrently": "7.6.0",
+    "electron": "28.3.3",
+    "electron-builder": "^26.8.1",
     "prisma": "^6.8.2",
+    "sharp": "^0.34.5",
+    "to-ico": "^1.1.5",
     "vite": "4.5.14",
     "wait-on": "7.2.0"
+  },
+  "build": {
+    "appId": "com.xiajaketse.shopeechangeDaysToShip",
+    "productName": "shopeeChangeDTS",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**",
+      "dist/**",
+      "node_modules/**",
+      "package.json"
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "xiajaketse",
+        "repo": "shopeechangeDaysToShip",
+        "releaseType": "release"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "include": "build/installer.nsh",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "artifactName": "installer-${version}.${ext}",
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": false,
+      "warningsAsErrors": false,
+      "differentialPackage": false,
+      "guid": "shopee-change-days-to-ship-${version}"
+    }
   }
 }
