@@ -2,7 +2,7 @@
   "name": "change-days-to-ship-electron",
   "version": "1.0.2",
   "description": "Shopee tool for fetching products and updating days to ship",
-  "author": "xiajaketse",
+  "author": "jaketse",
   "private": false,
   "type": "module",
   "main": "src/main/main.js",
@@ -34,7 +34,7 @@
     "wait-on": "7.2.0"
   },
   "build": {
-    "appId": "com.xiajaketse.shopeechangeDaysToShip",
+    "appId": "com.jaketse.shopeechangeDaysToShip",
     "productName": "shopeeChangeDTS",
     "directories": {
       "output": "release"
@@ -48,7 +48,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "xiajaketse",
+        "owner": "jaketse",
         "repo": "shopeechangeDaysToShip",
         "releaseType": "release"
       }
