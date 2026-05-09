@@ -328,80 +328,111 @@ async function executeBatchChange(accountId, days) {
   const list = db.prepare('SELECT * FROM products WHERE account_id = ? AND in_change_list = 1').all(accountId);
   if (list.length === 0) throw new Error('No product in change list');
   let ok = 0; let fail = 0; let skip = 0; let done = 0;
-  let rateLimitUntil = 0;
+  const deferred429 = [];
   addLog(accountId, 'change', `Batch start. total=${list.length}, days=${days}`);
   const startedAt = Date.now();
   const queue = [...list];
-  const waitIfRateLimited = async () => {
-    const nowMs = Date.now();
-    if (rateLimitUntil > nowMs) {
-      const waitMs = rateLimitUntil - nowMs;
-      addLog(accountId, 'change', `Rate limit cooldown: wait ${Math.ceil(waitMs / 1000)}s`, 'info');
-      await new Promise((r) => setTimeout(r, waitMs));
+  const sleepWithStop = async (ms) => {
+    let left = ms;
+    while (left > 0) {
+      ensureNotStopped(accountId);
+      const chunk = Math.min(1000, left);
+      await new Promise((r) => setTimeout(r, chunk));
+      left -= chunk;
     }
+  };
+  const updateProgressLog = () => {
+    const percent = Math.floor((done / list.length) * 100);
+    const elapsedSec = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
+    const speed = done / elapsedSec;
+    const etaSec = speed > 0 ? Math.round((list.length - done) / speed) : 0;
+    addLog(
+      accountId,
+      'change',
+      `Progress change: ${done}/${list.length} success=${ok} fail=${fail} skip=${skip} percent=${percent} speed=${speed.toFixed(2)} eta=${etaSec}s`,
+    );
+  };
+  const processOneItem = async (p, phaseLabel) => {
+    addLog(accountId, 'change', `Item start(${phaseLabel}): ${p.product_id} ${p.name}`);
+    let err = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        addLog(accountId, 'change', `Item ${p.product_id} attempt ${attempt}/3: get_product_info`);
+        const info = await getProductInfo(acc.cookie_json, p.product_id, false);
+        const currentDays = Number(info?.pre_order_info?.days_to_ship ?? 0);
+        if (currentDays === days) {
+          skip += 1;
+          db.prepare('UPDATE products SET days_to_ship = ?, is_pre_order = ? WHERE account_id = ? AND product_id = ?')
+            .run(currentDays, currentDays > 0 ? 1 : 0, accountId, p.product_id);
+          addLog(accountId, 'change', `Skipped: ${p.product_id} ${p.name} days_to_ship unchanged (${currentDays})`, 'info');
+          done += 1;
+          updateProgressLog();
+          return 'done';
+        }
+
+        addLog(accountId, 'change', `Item ${p.product_id} attempt ${attempt}/3: update days ${currentDays} -> ${days}`);
+        await randomSleep();
+        await updateDaysToShip(acc.cookie_json, p.product_id, days, info);
+        ok += 1;
+        db.prepare('UPDATE products SET days_to_ship = ?, is_pre_order = ? WHERE account_id = ? AND product_id = ?')
+          .run(days, days > 0 ? 1 : 0, accountId, p.product_id);
+        addLog(accountId, 'change', `Success: ${p.product_id} ${p.name} ${currentDays} -> ${days}`, 'success');
+        done += 1;
+        updateProgressLog();
+        return 'done';
+      } catch (e) {
+        err = e;
+        const msg = String(e?.message || e || '');
+        addLog(accountId, 'change', `Item ${p.product_id} attempt ${attempt}/3 failed: ${msg}`, 'error');
+        if (/HTTP 429/i.test(msg)) {
+          const waitSec = attempt * 2;
+          addLog(accountId, 'change', `Rate limited (429). wait ${waitSec}s then retry`, 'info');
+          await sleepWithStop(waitSec * 1000);
+        } else {
+          if (attempt < 3) await randomSleep();
+        }
+      }
+    }
+
+    if (/HTTP 429/i.test(String(err?.message || err || ''))) {
+      addLog(accountId, 'change', `Defer 429 item to tail queue: ${p.product_id} ${p.name}`, 'info');
+      return 'defer429';
+    }
+
+    fail += 1;
+    done += 1;
+    addLog(accountId, 'change', `Failed: ${p.product_id} ${p.name} ${err?.message || err}`, 'error');
+    updateProgressLog();
+    return 'failed';
   };
   const worker = async () => {
     while (queue.length > 0) {
       ensureNotStopped(accountId);
-      await waitIfRateLimited();
       const p = queue.shift();
       if (!p) break;
-      let err = null;
-      let handled = false;
-      addLog(accountId, 'change', `Item start: ${p.product_id} ${p.name}`);
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
-        try {
-          addLog(accountId, 'change', `Item ${p.product_id} attempt ${attempt}/3: get_product_info`);
-          const info = await getProductInfo(acc.cookie_json, p.product_id, false);
-          const currentDays = Number(info?.pre_order_info?.days_to_ship ?? 0);
-          if (currentDays === days) {
-            skip += 1;
-            handled = true;
-            db.prepare('UPDATE products SET days_to_ship = ?, is_pre_order = ? WHERE account_id = ? AND product_id = ?')
-              .run(currentDays, currentDays > 0 ? 1 : 0, accountId, p.product_id);
-            addLog(accountId, 'change', `Skipped: ${p.product_id} ${p.name} days_to_ship unchanged (${currentDays})`, 'info');
-            break;
-          }
-
-          addLog(accountId, 'change', `Item ${p.product_id} attempt ${attempt}/3: update days ${currentDays} -> ${days}`);
-          await randomSleep();
-          await updateDaysToShip(acc.cookie_json, p.product_id, days, info);
-          ok += 1;
-          handled = true;
-          db.prepare('UPDATE products SET days_to_ship = ?, is_pre_order = ? WHERE account_id = ? AND product_id = ?')
-            .run(days, days > 0 ? 1 : 0, accountId, p.product_id);
-          addLog(accountId, 'change', `Success: ${p.product_id} ${p.name} ${currentDays} -> ${days}`, 'success');
-          break;
-        } catch (e) {
-          err = e;
-          const msg = String(e?.message || e || '');
-          addLog(accountId, 'change', `Item ${p.product_id} attempt ${attempt}/3 failed: ${msg}`, 'error');
-          if (/HTTP 429/i.test(msg)) {
-            const cooldownMs = 6000 + Math.floor(Math.random() * 4000) + (attempt - 1) * 4000;
-            rateLimitUntil = Math.max(rateLimitUntil, Date.now() + cooldownMs);
-            addLog(accountId, 'change', `Rate limited (429). cooldown ${Math.ceil(cooldownMs / 1000)}s then retry`, 'info');
-          }
-          if (attempt < 3) await randomSleep();
-        }
+      const status = await processOneItem(p, 'main');
+      if (status === 'defer429') {
+        deferred429.push(p);
       }
-      if (!handled) {
-        fail += 1;
-        addLog(accountId, 'change', `Failed: ${p.product_id} ${p.name} ${err?.message || err}`, 'error');
-      }
-      done += 1;
-      const percent = Math.floor((done / list.length) * 100);
-      const elapsedSec = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
-      const speed = done / elapsedSec;
-      const etaSec = speed > 0 ? Math.round((list.length - done) / speed) : 0;
-      addLog(
-        accountId,
-        'change',
-        `Progress change: ${done}/${list.length} success=${ok} fail=${fail} skip=${skip} percent=${percent} speed=${speed.toFixed(2)} eta=${etaSec}s`,
-      );
       await randomSleep();
     }
   };
   await Promise.all(Array.from({ length: CHANGE_WORKERS }, () => worker()));
+  if (deferred429.length > 0) {
+    addLog(accountId, 'change', `Enter deferred-429 phase: pending=${deferred429.length}`, 'info');
+  }
+  while (deferred429.length > 0) {
+    ensureNotStopped(accountId);
+    addLog(accountId, 'change', `Deferred-429 round start: pending=${deferred429.length}. wait 30s`, 'info');
+    await sleepWithStop(30000);
+    const round = deferred429.splice(0, deferred429.length);
+    for (const p of round) {
+      ensureNotStopped(accountId);
+      const status = await processOneItem(p, 'deferred429');
+      if (status === 'defer429') deferred429.push(p);
+      await randomSleep();
+    }
+  }
   addLog(accountId, 'change', `Batch finished. success=${ok}, skipped=${skip}, failed=${fail}`, 'success');
   return { ok, fail, skip };
 }

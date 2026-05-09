@@ -1,4 +1,4 @@
-﻿import { app, BrowserWindow, dialog } from 'electron';
+﻿import { app, BrowserWindow, Menu, dialog } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import updaterPkg from 'electron-updater';
@@ -62,6 +62,10 @@ function createWindow() {
 function setupAutoUpdate(win) {
   if (isDev) return;
 
+  autoUpdater.setFeedURL({
+    provider: 'generic',
+    url: 'https://github.com/xiajaketse/shopeechangeDaysToShip/releases/latest/download',
+  });
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
 
@@ -117,6 +121,47 @@ function setupAutoUpdate(win) {
   });
 }
 
+function setupAppMenu(win) {
+  const template = [
+    {
+      label: 'Help',
+      submenu: [
+        {
+          label: 'Check for Updates',
+          click: () => {
+            if (isDev) {
+              dialog.showMessageBox(win, {
+                type: 'info',
+                title: 'Check for Updates',
+                message: 'Dev mode does not check for updates.',
+              }).catch(() => {});
+              return;
+            }
+            autoUpdater.checkForUpdates().catch((e) => {
+              dialog.showMessageBox(win, {
+                type: 'error',
+                title: 'Check for Updates',
+                message: `Failed to check updates: ${e?.message || e}`,
+              }).catch(() => {});
+            });
+          },
+        },
+        {
+          label: 'About',
+          click: () => {
+            dialog.showMessageBox(win, {
+              type: 'info',
+              title: 'About',
+              message: `shopeeChangeDTS\nVersion ${app.getVersion()}`,
+            }).catch(() => {});
+          },
+        },
+      ],
+    },
+  ];
+  const menu = Menu.buildFromTemplate(template);
+  Menu.setApplicationMenu(menu);
+}
 app.on('second-instance', () => {
   if (!mainWindow) return;
   if (mainWindow.isMinimized()) mainWindow.restore();
@@ -134,10 +179,12 @@ app.whenReady().then(() => {
 }).then(() => {
   initHandlers();
   mainWindow = createWindow();
+  setupAppMenu(mainWindow);
   setupAutoUpdate(mainWindow);
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = createWindow();
+      setupAppMenu(mainWindow);
     }
   });
 });
@@ -150,3 +197,6 @@ app.on('before-quit', () => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+
+
+
