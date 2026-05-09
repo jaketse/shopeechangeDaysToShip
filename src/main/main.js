@@ -1,4 +1,4 @@
-﻿import { app, BrowserWindow, Menu, dialog } from 'electron';
+﻿import { app, BrowserWindow, Menu, Notification, dialog } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import updaterPkg from 'electron-updater';
@@ -62,10 +62,7 @@ function createWindow() {
 function setupAutoUpdate(win) {
   if (isDev) return;
 
-  autoUpdater.setFeedURL({
-    provider: 'generic',
-    url: 'https://github.com/xiajaketse/shopeechangeDaysToShip/releases/latest/download',
-  });
+  let manualCheckPending = false;
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
 
@@ -92,6 +89,14 @@ function setupAutoUpdate(win) {
 
   autoUpdater.on('update-not-available', () => {
     console.log('[auto-update] no update');
+    if (manualCheckPending) {
+      manualCheckPending = false;
+      dialog.showMessageBox(win, {
+        type: 'info',
+        title: 'Check for Updates',
+        message: '目前已是最新版本。',
+      }).catch(() => {});
+    }
   });
 
   autoUpdater.on('download-progress', (p) => {
@@ -114,11 +119,39 @@ function setupAutoUpdate(win) {
 
   autoUpdater.on('error', (e) => {
     console.error('[auto-update] error:', e);
+    if (manualCheckPending) {
+      manualCheckPending = false;
+      dialog.showMessageBox(win, {
+        type: 'error',
+        title: 'Check for Updates',
+        message: `Failed to check updates: ${e?.message || e}`,
+      }).catch(() => {});
+    }
   });
 
   autoUpdater.checkForUpdates().catch((e) => {
     console.error('[auto-update] check failed:', e);
   });
+
+  return {
+    manualCheck: () => {
+      manualCheckPending = true;
+      if (Notification.isSupported()) {
+        new Notification({
+          title: 'Check for Updates',
+          body: '正在檢查更新，請稍候...',
+        }).show();
+      }
+      autoUpdater.checkForUpdates().catch((e) => {
+        manualCheckPending = false;
+        dialog.showMessageBox(win, {
+          type: 'error',
+          title: 'Check for Updates',
+          message: `Failed to check updates: ${e?.message || e}`,
+        }).catch(() => {});
+      });
+    },
+  };
 }
 
 function setupAppMenu(win) {
@@ -137,13 +170,7 @@ function setupAppMenu(win) {
               }).catch(() => {});
               return;
             }
-            autoUpdater.checkForUpdates().catch((e) => {
-              dialog.showMessageBox(win, {
-                type: 'error',
-                title: 'Check for Updates',
-                message: `Failed to check updates: ${e?.message || e}`,
-              }).catch(() => {});
-            });
+            win.__manualCheckForUpdates?.();
           },
         },
         {
@@ -180,11 +207,14 @@ app.whenReady().then(() => {
   initHandlers();
   mainWindow = createWindow();
   setupAppMenu(mainWindow);
-  setupAutoUpdate(mainWindow);
+  const updater = setupAutoUpdate(mainWindow);
+  if (updater?.manualCheck) mainWindow.__manualCheckForUpdates = updater.manualCheck;
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = createWindow();
       setupAppMenu(mainWindow);
+      const updater2 = setupAutoUpdate(mainWindow);
+      if (updater2?.manualCheck) mainWindow.__manualCheckForUpdates = updater2.manualCheck;
     }
   });
 });
@@ -197,6 +227,7 @@ app.on('before-quit', () => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+
 
 
 

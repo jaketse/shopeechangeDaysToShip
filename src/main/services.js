@@ -1,4 +1,4 @@
-import { ipcMain } from 'electron';
+﻿import { ipcMain } from 'electron';
 import { dbApi as db } from './db.js';
 import { fetchAllProducts, getProductInfo, getShopInfo, randomSleep, updateDaysToShip } from './shopee-client.js';
 
@@ -109,6 +109,7 @@ async function executeFetchProducts(accountId) {
   let perfApiMs = 0;
   let perfDbMs = 0;
   let perfTotalMs = 0;
+  const detailDeferred429 = [];
   const upsertBasic = db.prepare(`
       INSERT INTO products (account_id, product_id, name, image, price, stock, days_to_ship, status, is_pre_order, detail_json, fetched_at, exists_in_latest)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
@@ -118,6 +119,15 @@ async function executeFetchProducts(accountId) {
         fetched_at=excluded.fetched_at,exists_in_latest=1
     `);
   const updateDetail = db.prepare('UPDATE products SET detail_json = ?, fetched_at = ?, days_to_ship = ?, is_pre_order = ? WHERE account_id = ? AND product_id = ?');
+  const sleepWithStop = async (ms) => {
+    let left = ms;
+    while (left > 0) {
+      ensureNotStopped(accountId);
+      const chunk = Math.min(1000, left);
+      await new Promise((r) => setTimeout(r, chunk));
+      left -= chunk;
+    }
+  };
 
   const runDetailWorker = async () => {
     while (!listDone || detailQueue.length > 0) {
@@ -267,11 +277,21 @@ async function executeDetailPhase(accountId, cookieJson, onlyPending = false) {
   const latestList = db.prepare(sql).all(accountId);
   addLog(accountId, 'products', `Start detail phase. total=${latestList.length}${onlyPending ? ' (pending only)' : ''}`);
   const updateDetail = db.prepare('UPDATE products SET detail_json = ?, fetched_at = ?, days_to_ship = ?, is_pre_order = ? WHERE account_id = ? AND product_id = ?');
+  const sleepWithStop = async (ms) => {
+    let left = ms;
+    while (left > 0) {
+      ensureNotStopped(accountId);
+      const chunk = Math.min(1000, left);
+      await new Promise((r) => setTimeout(r, chunk));
+      left -= chunk;
+    }
+  };
   let detailOk = 0;
   let detailDone = 0;
   let perfApiMs = 0;
   let perfDbMs = 0;
   let perfTotalMs = 0;
+  const detailDeferred429 = [];
   const queue = latestList.map((x) => x.product_id);
   const worker = async () => {
     while (queue.length > 0) {
@@ -596,3 +616,4 @@ export function initHandlers() {
   resumeInterruptedTasks();
   startLogCleanupScheduler();
 }
+

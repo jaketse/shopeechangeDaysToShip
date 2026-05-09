@@ -1,6 +1,6 @@
 {
   "name": "change-days-to-ship-electron",
-  "version": "1.0.2",
+  "version": "1.0.4",
   "description": "Shopee tool for fetching products and updating days to ship",
   "author": "jaketse",
   "private": false,

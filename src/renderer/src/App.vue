@@ -119,8 +119,8 @@
             </button>
           </div>
           <div class="toolbar">
-            <input v-model.number="newDays" type="number" min="0" max="30" />
-            <button :disabled="isAccountRunning(selectedId)" @click="batchChange">批量修改</button>
+            <input v-model.trim="newDays" type="text" inputmode="numeric" placeholder="輸入 0-30 天" />
+            <button :disabled="isAccountRunning(selectedId) || !canBatchChange" @click="batchChange">批量修改</button>
             <button @click="loadChangeList">刷新</button>
             <select v-model.number="changePageSize">
               <option :value="20">20 / 頁</option>
@@ -184,7 +184,7 @@ const changeLogs = ref([]);
 const showAddForm = ref(false);
 const newShopId = ref('');
 const newCookieJson = ref('');
-const newDays = ref(2);
+const newDays = ref('');
 const checked = reactive(new Set());
 const checkedChange = reactive(new Set());
 const notice = ref({ text: '', type: 'error' });
@@ -198,6 +198,8 @@ const productProgressPercent = ref(0);
 const changeProgressPercent = ref(0);
 const productProgressText = ref('');
 const changeProgressText = ref('');
+const productTaskStartedAt = ref(0);
+const changeTaskStartedAt = ref(0);
 const accountProgressMap = reactive({});
 const productFilter = ref('');
 const onlyStale = ref(false);
@@ -258,6 +260,12 @@ const sortedChangeList = computed(() => {
 const pagedChangeList = computed(() => {
   const start = (changePage.value - 1) * changePageSize.value;
   return sortedChangeList.value.slice(start, start + changePageSize.value);
+});
+const canBatchChange = computed(() => {
+  const s = String(newDays.value ?? '').trim();
+  if (!/^\d+$/.test(s)) return false;
+  const n = Number(s);
+  return Number.isInteger(n) && n >= 0 && n <= 30;
 });
 
 watch([filteredProducts, productPageSize], () => {
@@ -337,6 +345,16 @@ function parseProgressFromLogs() {
     return `${ss}s`;
   };
   const selectedRunning = isAccountRunning(selectedId.value);
+  const productScopedLogs = (() => {
+    if (!selectedRunning || !productTaskStartedAt.value) return productLogs.value;
+    const scoped = productLogs.value.filter((x) => Number(x.created_at || 0) >= productTaskStartedAt.value);
+    return scoped.length ? scoped : [];
+  })();
+  const changeScopedLogs = (() => {
+    if (!selectedRunning || !changeTaskStartedAt.value) return changeLogs.value;
+    const scoped = changeLogs.value.filter((x) => Number(x.created_at || 0) >= changeTaskStartedAt.value);
+    return scoped.length ? scoped : [];
+  })();
   const productStopped = productLogs.value.some((x) => /Stop requested by user|Task stopped by user/i.test(x.message));
   const changeStopped = changeLogs.value.some((x) => /Stop requested by user|Task stopped by user/i.test(x.message));
 
@@ -344,14 +362,14 @@ function parseProgressFromLogs() {
     productProgressText.value = '已終止';
     productProgressPercent.value = 0;
   } else {
-  const dLog = productLogs.value.find((x) => /Progress detail:/.test(x.message));
+  const dLog = productScopedLogs.find((x) => /Progress detail:/.test(x.message));
   if (dLog) {
     const m = dLog.message.match(/Progress detail:\s*(\d+)\/(\d+)\s+success=(\d+)\s+percent=(\d+)/);
     if (m) {
       const done = Number(m[1]) || 0;
       const total = Number(m[2]) || 0;
-      const startIdx = productLogs.value.findIndex((x) => /Start fetching products/.test(x.message));
-      const scoped = startIdx >= 0 ? productLogs.value.slice(0, startIdx + 1) : productLogs.value;
+      const startIdx = productScopedLogs.findIndex((x) => /Start fetching products/.test(x.message));
+      const scoped = startIdx >= 0 ? productScopedLogs.slice(0, startIdx + 1) : productScopedLogs;
       const progressLogs = [...scoped]
         .filter((x) => /Progress detail:/.test(x.message))
         .reverse();
@@ -374,7 +392,7 @@ function parseProgressFromLogs() {
       productProgressPercent.value = Number(m[4]) || 0;
     }
   } else {
-    const pLog = productLogs.value.find((x) => /Progress fetch:/.test(x.message));
+    const pLog = productScopedLogs.find((x) => /Progress fetch:/.test(x.message));
     if (pLog) {
       const m = pLog.message.match(/products=(\d+)\/(\d+)\s+percent=(\d+)/);
       if (m) {
@@ -395,7 +413,7 @@ function parseProgressFromLogs() {
     changeProgressText.value = '已終止';
     changeProgressPercent.value = 0;
   } else {
-  const cLog = changeLogs.value.find((x) => /Progress change:/.test(x.message));
+  const cLog = changeScopedLogs.find((x) => /Progress change:/.test(x.message));
   if (cLog) {
     const m = cLog.message.match(/Progress change:\s*(\d+\/\d+)\s+success=(\d+)\s+fail=(\d+)(?:\s+skip=\d+)?\s+percent=(\d+)/);
     if (m) {
@@ -610,8 +628,9 @@ async function removeAccount(id) {
 async function fetchProducts() {
   const id = selectedId.value;
   runningByAccount[String(id)] = true;
+  productTaskStartedAt.value = Math.floor(Date.now() / 1000);
   productProgressPercent.value = 0;
-  productProgressText.value = '';
+  productProgressText.value = '拉取任務啟動中...';
   activeTaskAccounts.add(String(id));
   startLiveLogPolling();
   try {
@@ -624,6 +643,7 @@ async function fetchProducts() {
     }
   } finally {
     runningByAccount[String(id)] = false;
+    productTaskStartedAt.value = 0;
     activeTaskAccounts.delete(String(id));
     stopLiveLogPolling();
     await loadLogGroups();
@@ -668,7 +688,7 @@ async function removeCheckedFromChangeList() {
 async function batchChange() {
   const id = selectedId.value;
   const total = changeList.value.length;
-  const days = Number(newDays.value);
+  const days = Number(String(newDays.value ?? '').trim());
   if (!Number.isInteger(days) || days < 0 || days > 30) {
     showNotice('天數必須是 0-30 的整數', 'error');
     return;
@@ -681,8 +701,9 @@ async function batchChange() {
   if (!ok) return;
 
   runningByAccount[String(id)] = true;
+  changeTaskStartedAt.value = Math.floor(Date.now() / 1000);
   changeProgressPercent.value = 0;
-  changeProgressText.value = '';
+  changeProgressText.value = '修改任務啟動中...';
   activeTaskAccounts.add(String(id));
   startLiveLogPolling();
   try {
@@ -693,6 +714,7 @@ async function batchChange() {
     showNotice(msg, 'error');
   } finally {
     runningByAccount[String(id)] = false;
+    changeTaskStartedAt.value = 0;
     activeTaskAccounts.delete(String(id));
     stopLiveLogPolling();
     await loadLogGroups();
