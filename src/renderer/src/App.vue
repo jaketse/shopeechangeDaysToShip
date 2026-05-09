@@ -15,7 +15,7 @@
         </div>
       </div>
 
-      <ul class="account-list">
+      <ul class="account-list" :class="{ disabled: switchingAccount }">
         <li v-for="a in accounts" :key="a.id" :class="{active: selectedId===a.id}" @click="selectAccount(a.id)">
           <div class="account-head">
             <span>{{ a.shop_name || '-' }} (#{{ a.shop_id }})</span>
@@ -119,7 +119,13 @@
             </button>
           </div>
           <div class="toolbar">
-            <input v-model.trim="newDays" type="text" inputmode="numeric" placeholder="輸入 0-30 天" />
+            <div class="day-input-wrap">
+              <input v-model="newDays" type="number" min="0" max="30" step="1" placeholder="輸入 0-30 天" />
+              <div class="spinner-col">
+                <button class="spin-btn" type="button" @click="adjustNewDays(1)" aria-label="增加">▲</button>
+                <button class="spin-btn" type="button" @click="adjustNewDays(-1)" aria-label="減少">▼</button>
+              </div>
+            </div>
             <button :disabled="isAccountRunning(selectedId) || !canBatchChange" @click="batchChange">批量修改</button>
             <button @click="loadChangeList">刷新</button>
             <select v-model.number="changePageSize">
@@ -217,6 +223,8 @@ const productLogGroups = ref([]);
 const changeLogGroups = ref([]);
 const productLogGroupId = ref('');
 const changeLogGroupId = ref('');
+let selectAccountReqSeq = 0;
+const switchingAccount = ref(false);
 
 const filteredProducts = computed(() => {
   const keyword = productFilter.value.toLowerCase();
@@ -519,21 +527,41 @@ function stopLiveLogPolling() {
 }
 
 function toggleAddForm() { showAddForm.value = !showAddForm.value; }
-function selectAccount(id) {
+async function selectAccount(id) {
+  if (switchingAccount.value) return;
+  switchingAccount.value = true;
+  const reqSeq = ++selectAccountReqSeq;
   selectedId.value = id;
   checked.clear();
   checkedChange.clear();
   productLogGroupId.value = '';
   changeLogGroupId.value = '';
-  loadLogGroups();
-  loadProducts();
-  loadChangeList();
+  products.value = [];
+  changeList.value = [];
+  productLogs.value = [];
+  changeLogs.value = [];
+  productProgressPercent.value = 0;
+  changeProgressPercent.value = 0;
+  productProgressText.value = '';
+  changeProgressText.value = '';
+  try {
+    await Promise.all([loadLogGroups(), loadProducts(), loadChangeList()]);
+  } finally {
+    switchingAccount.value = false;
+    if (reqSeq !== selectAccountReqSeq) return;
+  }
 }
 function toggleCheck(id, on) { on ? checked.add(id) : checked.delete(id); }
 function toggleChange(id, on) { on ? checkedChange.add(id) : checkedChange.delete(id); }
 function sortMark(activeKey, activeDir, key) {
   if (activeKey.value !== key) return '';
   return activeDir.value === 'asc' ? '▲' : (activeDir.value === 'desc' ? '▼' : '');
+}
+function adjustNewDays(delta) {
+  const s = String(newDays.value ?? '').trim();
+  let n = /^\d+$/.test(s) ? Number(s) : 0;
+  n = Math.max(0, Math.min(30, n + delta));
+  newDays.value = String(n);
 }
 function toggleProductSort(key) {
   if (productSortKey.value !== key) {
@@ -644,8 +672,11 @@ async function fetchProducts() {
   } finally {
     runningByAccount[String(id)] = false;
     productTaskStartedAt.value = 0;
+    accountProgressMap[String(id)] = '';
     activeTaskAccounts.delete(String(id));
     stopLiveLogPolling();
+    await refreshRunningState();
+    await refreshAccountBadges();
     await loadLogGroups();
     if (selectedId.value === id) await loadProducts();
   }
@@ -715,8 +746,11 @@ async function batchChange() {
   } finally {
     runningByAccount[String(id)] = false;
     changeTaskStartedAt.value = 0;
+    accountProgressMap[String(id)] = '';
     activeTaskAccounts.delete(String(id));
     stopLiveLogPolling();
+    await refreshRunningState();
+    await refreshAccountBadges();
     await loadLogGroups();
     if (selectedId.value === id) {
       await loadProducts();
@@ -775,6 +809,7 @@ input,textarea{width:100%}
 button{background:#fff;cursor:pointer}
 button.primary{background:#2563eb;color:#fff;border-color:#2563eb}
 .account-list{list-style:none;padding:0;margin:0}
+.account-list.disabled{opacity:.55;pointer-events:none;filter:grayscale(.2)}
 li{border:1px solid #e5e7eb;padding:10px;margin:8px 0;cursor:pointer;border-radius:8px;background:#fff}
 li.active{background:#eff6ff;border-color:#93c5fd}
 .account-head{display:flex;justify-content:space-between;gap:8px;align-items:center}
@@ -783,6 +818,15 @@ li.active{background:#eff6ff;border-color:#93c5fd}
 header{display:flex;gap:8px;margin-bottom:12px}
 .activeTab{background:#111827;color:#fff;border-color:#111827}
 .toolbar{display:flex;gap:8px;margin-bottom:8px}
+.day-input-wrap{position:relative;width:170px}
+.day-input-wrap input[type="number"]{padding-right:30px}
+.day-input-wrap input[type="number"]::-webkit-outer-spin-button,
+.day-input-wrap input[type="number"]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.day-input-wrap input[type="number"]{-moz-appearance:textfield}
+.spinner-col{position:absolute;right:4px;top:4px;bottom:4px;display:flex;flex-direction:column;justify-content:space-between;gap:3px}
+.spin-btn{width:22px;height:15px;line-height:11px;padding:0;font-size:10px;border:1px solid #d1d5db;border-radius:4px;background:#fff;color:#374151}
+.spin-btn:hover{background:#f3f4f6}
+.spin-btn:active{transform:scale(.97)}
 .inline{display:flex;align-items:center;gap:6px;font-size:13px}
 table{width:100%;border-collapse:collapse;margin-bottom:8px;background:#fff}
 th,td{border:1px solid #e5e7eb;padding:6px;text-align:left}
