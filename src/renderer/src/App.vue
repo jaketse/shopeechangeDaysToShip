@@ -22,8 +22,17 @@
             <span v-if="accountBadge(a.id)" class="account-badge">{{ accountBadge(a.id) }}</span>
           </div>
           <div class="row">
+            <button @click.stop="startEditAccount(a)">編輯</button>
             <button @click.stop="validate(a.id)">驗證</button>
             <button @click.stop="removeAccount(a.id)">刪除</button>
+          </div>
+          <div v-if="editingAccountId===a.id" class="edit-form" @click.stop>
+            <input v-model="editShopId" placeholder="Shop ID" />
+            <textarea v-model="editCookieJson" rows="5" placeholder="Cookie JSON" />
+            <div class="add-row">
+              <button class="primary" @click="saveEditAccount(a.id)">保存</button>
+              <button @click="cancelEditAccount">取消</button>
+            </div>
           </div>
         </li>
       </ul>
@@ -78,11 +87,11 @@
                 </select>
                 <div class="pick-stat">已選 {{ checked.size }} / 本頁 {{ pagedProducts.length }}</div>
               </th>
-              <th class="sortable" @click="toggleProductSort('product_id')">ID {{ sortMark(productSortKey, productSortDir, 'product_id') }}</th>
-              <th class="sortable" @click="toggleProductSort('name')">Name {{ sortMark(productSortKey, productSortDir, 'name') }}</th>
-              <th class="sortable" @click="toggleProductSort('days_to_ship')">DTS {{ sortMark(productSortKey, productSortDir, 'days_to_ship') }}</th>
-              <th class="sortable" @click="toggleProductSort('exists_in_latest')">Latest {{ sortMark(productSortKey, productSortDir, 'exists_in_latest') }}</th>
-              <th class="sortable" @click="toggleProductSort('in_change_list')">在修改清單 {{ sortMark(productSortKey, productSortDir, 'in_change_list') }}</th>
+              <th class="sortable" @click="toggleProductSort('product_id')">商品ID <span class="sort-arrow" :class="sortState(productSortKey, productSortDir, 'product_id')"></span></th>
+              <th class="sortable" @click="toggleProductSort('name')">商品名稱 <span class="sort-arrow" :class="sortState(productSortKey, productSortDir, 'name')"></span></th>
+              <th class="sortable" @click="toggleProductSort('days_to_ship')">備貨天數 <span class="sort-arrow" :class="sortState(productSortKey, productSortDir, 'days_to_ship')"></span></th>
+              <th class="sortable" @click="toggleProductSort('exists_in_latest')">是否最新 <span class="sort-arrow" :class="sortState(productSortKey, productSortDir, 'exists_in_latest')"></span></th>
+              <th class="sortable" @click="toggleProductSort('in_change_list')">是否在修改清單 <span class="sort-arrow" :class="sortState(productSortKey, productSortDir, 'in_change_list')"></span></th>
             </tr></thead>
             <tbody>
               <tr v-for="p in pagedProducts" :key="p.product_id" :class="{ stale: !p.exists_in_latest }">
@@ -146,9 +155,9 @@
                 </select>
                 <div class="pick-stat">已選 {{ checkedChange.size }} / 本頁 {{ pagedChangeList.length }}</div>
               </th>
-              <th class="sortable" @click="toggleChangeSort('product_id')">ID {{ sortMark(changeSortKey, changeSortDir, 'product_id') }}</th>
-              <th class="sortable" @click="toggleChangeSort('name')">Name {{ sortMark(changeSortKey, changeSortDir, 'name') }}</th>
-              <th class="sortable" @click="toggleChangeSort('days_to_ship')">DTS {{ sortMark(changeSortKey, changeSortDir, 'days_to_ship') }}</th>
+              <th class="sortable" @click="toggleChangeSort('product_id')">商品ID <span class="sort-arrow" :class="sortState(changeSortKey, changeSortDir, 'product_id')"></span></th>
+              <th class="sortable" @click="toggleChangeSort('name')">商品名稱 <span class="sort-arrow" :class="sortState(changeSortKey, changeSortDir, 'name')"></span></th>
+              <th class="sortable" @click="toggleChangeSort('days_to_ship')">備貨天數 <span class="sort-arrow" :class="sortState(changeSortKey, changeSortDir, 'days_to_ship')"></span></th>
             </tr></thead>
             <tbody>
               <tr v-for="p in pagedChangeList" :key="p.product_id"><td><input type="checkbox" :checked="checkedChange.has(p.product_id)" @change="toggleChange(p.product_id, $event.target.checked)" /></td><td>{{ p.product_id }}</td><td>{{ p.name }}</td><td>{{ p.days_to_ship }}</td></tr>
@@ -190,6 +199,9 @@ const changeLogs = ref([]);
 const showAddForm = ref(false);
 const newShopId = ref('');
 const newCookieJson = ref('');
+const editingAccountId = ref(null);
+const editShopId = ref('');
+const editCookieJson = ref('');
 const newDays = ref('');
 const checked = reactive(new Set());
 const checkedChange = reactive(new Set());
@@ -554,8 +566,16 @@ async function selectAccount(id) {
 function toggleCheck(id, on) { on ? checked.add(id) : checked.delete(id); }
 function toggleChange(id, on) { on ? checkedChange.add(id) : checkedChange.delete(id); }
 function sortMark(activeKey, activeDir, key) {
-  if (activeKey.value !== key) return '';
-  return activeDir.value === 'asc' ? '▲' : (activeDir.value === 'desc' ? '▼' : '');
+  const k = typeof activeKey === 'object' && activeKey !== null ? activeKey.value : activeKey;
+  const d = typeof activeDir === 'object' && activeDir !== null ? activeDir.value : activeDir;
+  if (k !== key) return '';
+  return d === 'asc' ? '▲' : (d === 'desc' ? '▼' : '');
+}
+function sortState(activeKey, activeDir, key) {
+  const k = typeof activeKey === 'object' && activeKey !== null ? activeKey.value : activeKey;
+  const d = typeof activeDir === 'object' && activeDir !== null ? activeDir.value : activeDir;
+  if (k !== key) return '';
+  return d === 'asc' ? 'asc' : (d === 'desc' ? 'desc' : '');
 }
 function adjustNewDays(delta) {
   const s = String(newDays.value ?? '').trim();
@@ -628,6 +648,43 @@ async function addAccount() {
     newShopId.value = '';
     newCookieJson.value = '';
     showAddForm.value = false;
+    await loadAccounts();
+  } catch (e) {
+    showNotice(getErrMsg(e), 'error');
+  }
+}
+
+function startEditAccount(a) {
+  editingAccountId.value = a.id;
+  editShopId.value = String(a.shop_id ?? '');
+  editCookieJson.value = String(a.cookie_json ?? '');
+}
+
+function cancelEditAccount() {
+  editingAccountId.value = null;
+  editShopId.value = '';
+  editCookieJson.value = '';
+}
+
+async function saveEditAccount(id) {
+  try {
+    const acc = accounts.value.find((x) => x.id === id);
+    if (!acc) throw new Error('Account not found');
+    const shopId = Number(String(editShopId.value || '').trim());
+    if (!Number.isInteger(shopId) || shopId <= 0) {
+      throw new Error('Shop ID 必填且必須是正整數');
+    }
+    const cookieText = String(editCookieJson.value || '').trim();
+    if (!cookieText) throw new Error('Cookie JSON 不能為空');
+
+    await getApi().updateAccountCookie(id, cookieText);
+    // 若用户修改了 shopId，则更新本地显示字段（不改校验逻辑：cookie 已验证属于该账号）
+    if (shopId !== Number(acc.shop_id)) {
+      const row = accounts.value.find((x) => x.id === id);
+      if (row) row.shop_id = shopId;
+    }
+    cancelEditAccount();
+    showNotice('賬戶已更新', 'success');
     await loadAccounts();
   } catch (e) {
     showNotice(getErrMsg(e), 'error');
@@ -803,6 +860,7 @@ onMounted(async () => {
 h2{margin:0 0 12px}
 .account-actions{margin-bottom:12px}
 .add-form{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#fafafa;margin-bottom:12px}
+.edit-form{border:1px dashed #d1d5db;border-radius:8px;padding:8px;background:#f8fafc;margin-top:8px}
 .add-row{display:flex;gap:8px}
 input,textarea,button{padding:8px;border:1px solid #d1d5db;border-radius:6px}
 input,textarea{width:100%}
@@ -831,6 +889,9 @@ header{display:flex;gap:8px;margin-bottom:12px}
 table{width:100%;border-collapse:collapse;margin-bottom:8px;background:#fff}
 th,td{border:1px solid #e5e7eb;padding:6px;text-align:left}
 .sortable{cursor:pointer;user-select:none}
+.sort-arrow{display:inline-flex;align-items:center;justify-content:center;min-width:12px;height:12px;margin-left:4px;color:#2563eb;font-weight:700}
+.sort-arrow.asc::before{content:'▲'}
+.sort-arrow.desc::before{content:'▼'}
 tr.stale{background:#fff2f2}
 .pager{display:flex;gap:8px;align-items:center;margin-bottom:8px}
 .pager span{font-size:12px;color:#374151}

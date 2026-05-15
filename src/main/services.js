@@ -470,16 +470,40 @@ async function runTaskWithRecord(accountId, taskType, payload, runner) {
 }
 
 function resumeInterruptedTasks() {
-  const tasks = db.prepare("SELECT * FROM task_queue WHERE status = 'running' ORDER BY id ASC").all();
+  const RETRY_WINDOW_SEC = 24 * 60 * 60;
+  const nowSec = now();
+  const isRetriableError = (msg) => {
+    const s = String(msg || '').toLowerCase();
+    if (!s) return false;
+    if (/task stopped by user/i.test(s)) return false;
+    return (
+      /http 429/.test(s)
+      || /rate limit/.test(s)
+      || /timeout|timed out|etimedout|econnreset|econnrefused|enotfound|eai_again|socket hang up/.test(s)
+      || /network|failed to fetch|fetch failed/.test(s)
+      || /request failed|gateway|bad gateway|service unavailable/.test(s)
+    );
+  };
+
+  const tasks = db.prepare(
+    "SELECT * FROM task_queue WHERE status = 'running' OR status = 'failed' ORDER BY id ASC",
+  ).all().filter((t) => {
+    if (t.status === 'running') return true;
+    const updatedAt = Number(t.updated_at || 0);
+    if (updatedAt <= 0 || nowSec - updatedAt > RETRY_WINDOW_SEC) return false;
+    return isRetriableError(t.last_error);
+  });
   if (!tasks.length) return;
   for (const t of tasks) {
     const accountId = Number(t.account_id);
     let payload = {};
     try { payload = JSON.parse(t.payload_json || '{}'); } catch {}
+    const resumeSource = t.status === 'running' ? 'interrupted' : 'retriable-failed';
     if (t.task_type === 'products_fetch') {
-      addLog(accountId, 'products', `Resuming interrupted task #${t.id}: products_fetch`, 'info');
+      addLog(accountId, 'products', `Resuming ${resumeSource} task #${t.id}: products_fetch`, 'info');
       runExclusive(accountId, async () => {
         try {
+          db.prepare("UPDATE task_queue SET status = 'running', updated_at = ? WHERE id = ?").run(now(), t.id);
           const acc = db.prepare('SELECT * FROM accounts WHERE id = ?').get(accountId);
           if (!acc) throw new Error('Account not found');
           const latestCount = Number(db.prepare('SELECT COUNT(1) AS c FROM products WHERE account_id = ? AND exists_in_latest = 1').get(accountId)?.c || 0);
@@ -499,9 +523,10 @@ function resumeInterruptedTasks() {
       }).catch(() => {});
     } else if (t.task_type === 'change_batch') {
       const days = Number(payload?.days);
-      addLog(accountId, 'change', `Resuming interrupted task #${t.id}: change_batch days=${days}`, 'info');
+      addLog(accountId, 'change', `Resuming ${resumeSource} task #${t.id}: change_batch days=${days}`, 'info');
       runExclusive(accountId, async () => {
         try {
+          db.prepare("UPDATE task_queue SET status = 'running', updated_at = ? WHERE id = ?").run(now(), t.id);
           await executeBatchChange(accountId, days);
           markTaskDone(t.id);
         } catch (e) {
