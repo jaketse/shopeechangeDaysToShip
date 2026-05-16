@@ -9,6 +9,8 @@ const LOG_RETENTION_DAYS = 15;
 const DETAIL_WORKERS = 10;
 const DETAIL_RETRY = 3;
 const CHANGE_WORKERS = 1;
+const FETCH_RESUME_INTERVAL_MS = 30000;
+const NETWORK_PROBE_INTERVAL_MS = 2000;
 let logCleanupTimer = null;
 
 function addLog(accountId, tab, message, type = 'info') {
@@ -22,6 +24,29 @@ function createTask(accountId, taskType, payload = {}) {
     INSERT INTO task_queue (account_id, task_type, payload_json, status, created_at, updated_at, last_error)
     VALUES (?, ?, ?, 'running', ?, ?, NULL)
   `).run(accountId, taskType, JSON.stringify(payload || {}), t, t).lastInsertRowid;
+}
+
+function findLatestListPhaseFinishedLogTime(accountId, fromTs) {
+  const row = db.prepare(`
+    SELECT created_at
+    FROM logs
+    WHERE account_id = ?
+      AND tab = 'products'
+      AND created_at >= ?
+      AND message LIKE 'List phase finished.%'
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(accountId, Number(fromTs || 0));
+  return Number(row?.created_at || 0);
+}
+
+function hasListPhaseFinishedForTask(accountId, taskRow) {
+  if (!taskRow) return false;
+  const startTs = Number(taskRow.created_at || 0);
+  if (!startTs) return false;
+  const endTs = Number(taskRow.updated_at || 0) || now();
+  const finishedTs = findLatestListPhaseFinishedLogTime(accountId, startTs);
+  return finishedTs >= startTs && finishedTs <= endTs + 1;
 }
 
 function markTaskDone(taskId) {
@@ -54,6 +79,69 @@ async function runExclusive(accountId, fn) {
 function ensureNotStopped(accountId) {
   if (stopRequested.has(accountId)) {
     throw new Error('Task stopped by user');
+  }
+}
+
+function getTaskPayload(taskId) {
+  const row = db.prepare('SELECT payload_json FROM task_queue WHERE id = ?').get(taskId);
+  if (!row?.payload_json) return {};
+  try {
+    return JSON.parse(row.payload_json) || {};
+  } catch {
+    return {};
+  }
+}
+
+function updateTaskPayload(taskId, patch) {
+  const prev = getTaskPayload(taskId);
+  const next = { ...prev, ...(patch || {}) };
+  db.prepare('UPDATE task_queue SET payload_json = ?, updated_at = ? WHERE id = ?')
+    .run(JSON.stringify(next), now(), taskId);
+}
+
+function isRetriableError(msg) {
+  const s = String(msg || '').toLowerCase();
+  if (!s) return false;
+  if (/task stopped by user/i.test(s)) return false;
+  return (
+    /http 429/.test(s)
+    || /rate limit/.test(s)
+    || /timeout|timed out|etimedout|econnreset|econnrefused|enotfound|eai_again|socket hang up/.test(s)
+    || /network|failed to fetch|fetch failed/.test(s)
+    || /request failed|gateway|bad gateway|service unavailable/.test(s)
+  );
+}
+
+function isRateLimitError(msg) {
+  return /http 429|rate limit/i.test(String(msg || ''));
+}
+
+function isNetworkError(msg) {
+  return /timeout|timed out|etimedout|econnreset|econnrefused|enotfound|eai_again|socket hang up|network|failed to fetch|fetch failed/i
+    .test(String(msg || ''));
+}
+
+async function waitForNetworkRecovery(accountId, tab, cookieJson) {
+  addLog(accountId, tab, `Network down, start probing every ${Math.floor(NETWORK_PROBE_INTERVAL_MS / 1000)}s`, 'info');
+  let probeCount = 0;
+  while (true) {
+    ensureNotStopped(accountId);
+    try {
+      await getShopInfo(cookieJson);
+      addLog(accountId, tab, 'Network probe passed, resume task', 'success');
+      return;
+    } catch (e) {
+      const msg = String(e?.message || e || '');
+      // If error is not network-like, stop probing and rethrow so task can fail fast.
+      if (!isNetworkError(msg)) {
+        throw e;
+      }
+      probeCount += 1;
+      if (probeCount % 15 === 0) {
+        addLog(accountId, tab, `Still offline after ${probeCount} probes`, 'info');
+      }
+      await new Promise((r) => setTimeout(r, NETWORK_PROBE_INTERVAL_MS));
+    }
   }
 }
 
@@ -93,23 +181,33 @@ function startLogCleanupScheduler() {
   scheduleNext();
 }
 
-async function executeFetchProducts(accountId) {
+async function executeFetchProducts(accountId, taskId = null, resumePayload = null) {
   ensureNotStopped(accountId);
   const acc = db.prepare('SELECT * FROM accounts WHERE id = ?').get(accountId);
   if (!acc) throw new Error('Account not found');
   addLog(accountId, 'products', 'Start fetching products');
+  const resume = resumePayload || {};
   const latestIds = new Set();
+  const hasCheckpoint = Boolean(resume?.list_initialized);
+  if (hasCheckpoint) {
+    const rows = db.prepare('SELECT product_id FROM products WHERE account_id = ? AND exists_in_latest = 1').all(accountId);
+    for (const r of rows) latestIds.add(r.product_id);
+    addLog(accountId, 'products', `Resume checkpoint loaded: cursor=${resume?.resume_cursor || ''} page=${Number(resume?.resume_page || 0)} fetched=${Number(resume?.fetched_count || 0)} latest=${latestIds.size}`, 'info');
+  }
   const detailQueued = new Set();
   const detailQueue = [];
   let detailDone = 0;
   let detailOk = 0;
-  let expectedTotal = 0;
+  let expectedTotal = Number(resume?.expected_total || 0);
   let listDone = false;
-  let fetchedTotal = 0;
+  let fetchedTotal = Number(resume?.fetched_count || 0);
+  let resumeCursor = String(resume?.resume_cursor || '');
+  let resumePage = Number(resume?.resume_page || 0);
   let perfApiMs = 0;
   let perfDbMs = 0;
   let perfTotalMs = 0;
   const detailDeferred429 = [];
+  const detailDeferredNet = [];
   const upsertBasic = db.prepare(`
       INSERT INTO products (account_id, product_id, name, image, price, stock, days_to_ship, status, is_pre_order, detail_json, fetched_at, exists_in_latest)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
@@ -129,6 +227,64 @@ async function executeFetchProducts(accountId) {
     }
   };
 
+  const logDetailProgress = () => {
+    const base = Math.max(expectedTotal, fetchedTotal, detailDone, 1);
+    const listNotFinished = !listDone;
+    const displayTotal = listNotFinished && detailDone >= base ? base + 1 : base;
+    const percent = Math.min(100, Math.floor((detailDone / displayTotal) * 100));
+    const statusSuffix = listNotFinished ? ' list=running' : ' list=done';
+    addLog(accountId, 'products', `Progress detail: ${detailDone}/${displayTotal} success=${detailOk} percent=${percent}${statusSuffix}`);
+    if (detailDone > 0 && detailDone % 20 === 0) {
+      const denom = Math.max(detailOk, 1);
+      addLog(
+        accountId,
+        'products',
+        `Detail perf summary done=${detailDone} ok=${detailOk} avg_api=${Math.round(perfApiMs / denom)}ms avg_db=${Math.round(perfDbMs / denom)}ms avg_total=${Math.round(perfTotalMs / denom)}ms`,
+      );
+    }
+  };
+
+  const processDetailItem = async (productId, phaseLabel = 'main') => {
+    const tStart = Date.now();
+    try {
+      const tApiStart = Date.now();
+      const detail = await withRetry(
+        () => getProductInfo(acc.cookie_json, productId, false),
+        DETAIL_RETRY,
+        (attempt, err) => addLog(accountId, 'products', `Detail retry ${attempt}/${DETAIL_RETRY}: ${productId} ${err?.message || err}`, 'error'),
+      );
+      const apiMs = Date.now() - tApiStart;
+      const dts = Number(detail?.pre_order_info?.days_to_ship ?? 0);
+      const isPre = detail?.pre_order_info?.pre_order ? 1 : 0;
+      const tDbStart = Date.now();
+      updateDetail.run(JSON.stringify(detail || {}), now(), dts, isPre, accountId, productId);
+      const dbMs = Date.now() - tDbStart;
+      const totalMs = Date.now() - tStart;
+      perfApiMs += apiMs;
+      perfDbMs += dbMs;
+      perfTotalMs += totalMs;
+      detailOk += 1;
+      addLog(accountId, 'products', `Detail perf item=${productId} api=${apiMs}ms db=${dbMs}ms total=${totalMs}ms phase=${phaseLabel}`);
+      detailDone += 1;
+      logDetailProgress();
+      return 'done';
+    } catch (e) {
+      const msg = String(e?.message || e || '');
+      if (isRateLimitError(msg)) {
+        addLog(accountId, 'products', `Detail defer429(${phaseLabel}): ${productId} ${msg}`, 'info');
+        return 'defer429';
+      }
+      if (isNetworkError(msg)) {
+        addLog(accountId, 'products', `Detail deferNet(${phaseLabel}): ${productId} ${msg}`, 'info');
+        return 'deferNet';
+      }
+      addLog(accountId, 'products', `Detail failed: ${productId} ${msg}`, 'error');
+      detailDone += 1;
+      logDetailProgress();
+      return 'failed';
+    }
+  };
+
   const runDetailWorker = async () => {
     while (!listDone || detailQueue.length > 0) {
       ensureNotStopped(accountId);
@@ -137,89 +293,112 @@ async function executeFetchProducts(accountId) {
         await sleepShort();
         continue;
       }
-      const tStart = Date.now();
-      try {
-        const tApiStart = Date.now();
-        const detail = await withRetry(
-          () => getProductInfo(acc.cookie_json, productId, false),
-          DETAIL_RETRY,
-          (attempt, err) => addLog(accountId, 'products', `Detail retry ${attempt}/${DETAIL_RETRY}: ${productId} ${err?.message || err}`, 'error'),
-        );
-        const apiMs = Date.now() - tApiStart;
-        const dts = Number(detail?.pre_order_info?.days_to_ship ?? 0);
-        const isPre = detail?.pre_order_info?.pre_order ? 1 : 0;
-        const tDbStart = Date.now();
-        updateDetail.run(JSON.stringify(detail || {}), now(), dts, isPre, accountId, productId);
-        const dbMs = Date.now() - tDbStart;
-        const totalMs = Date.now() - tStart;
-        perfApiMs += apiMs;
-        perfDbMs += dbMs;
-        perfTotalMs += totalMs;
-        detailOk += 1;
-        addLog(accountId, 'products', `Detail perf item=${productId} api=${apiMs}ms db=${dbMs}ms total=${totalMs}ms`);
-      } catch (e) {
-        addLog(accountId, 'products', `Detail failed: ${productId} ${e?.message || e}`, 'error');
-      } finally {
-        detailDone += 1;
-        const base = Math.max(expectedTotal, fetchedTotal, detailDone, 1);
-        const listNotFinished = !listDone;
-        const displayTotal = listNotFinished && detailDone >= base ? base + 1 : base;
-        let percent = Math.min(100, Math.floor((detailDone / displayTotal) * 100));
-        const statusSuffix = listNotFinished ? ' list=running' : ' list=done';
-        addLog(accountId, 'products', `Progress detail: ${detailDone}/${displayTotal} success=${detailOk} percent=${percent}${statusSuffix}`);
-        if (detailDone % 20 === 0) {
-          const denom = Math.max(detailOk, 1);
-          addLog(
-            accountId,
-            'products',
-            `Detail perf summary done=${detailDone} ok=${detailOk} avg_api=${Math.round(perfApiMs / denom)}ms avg_db=${Math.round(perfDbMs / denom)}ms avg_total=${Math.round(perfTotalMs / denom)}ms`,
-          );
-        }
+      const status = await processDetailItem(productId, 'main');
+      if (status === 'defer429') {
+        detailDeferred429.push(productId);
+      } else if (status === 'deferNet') {
+        detailDeferredNet.push(productId);
       }
       await detailPaceSleep();
     }
   };
   const detailWorkers = Array.from({ length: DETAIL_WORKERS }, () => runDetailWorker());
-  try {
+  if (!hasCheckpoint) {
     db.prepare('UPDATE products SET exists_in_latest = 0 WHERE account_id = ?').run(accountId);
-    await fetchAllProducts(
-      acc.cookie_json,
-      (m) => {
-        ensureNotStopped(accountId);
-        addLog(accountId, 'products', m);
-      },
-      (pageProducts, meta) => {
-        ensureNotStopped(accountId);
-        expectedTotal = Number(meta?.totalProducts || expectedTotal || 0);
-        const t = now();
-        for (const p of pageProducts) {
-          latestIds.add(p.product_id);
-          fetchedTotal += 1;
-          upsertBasic.run(
-            accountId,
-            p.product_id,
-            p.name,
-            p.image,
-            p.price,
-            p.stock,
-            p.days_to_ship,
-            p.status,
-            p.is_pre_order ? 1 : 0,
-            '{}',
-            t,
-          );
-          if (p.product_id && !detailQueued.has(p.product_id)) {
-            detailQueued.add(p.product_id);
-            detailQueue.push(p.product_id);
-          }
+  }
+  let fetchAttempt = 0;
+  try {
+    while (true) {
+      ensureNotStopped(accountId);
+      try {
+        await fetchAllProducts(
+          acc.cookie_json,
+          (m) => {
+            ensureNotStopped(accountId);
+            addLog(accountId, 'products', m);
+          },
+          (pageProducts, meta) => {
+            ensureNotStopped(accountId);
+            expectedTotal = Number(meta?.totalProducts || expectedTotal || 0);
+            resumeCursor = String(meta?.nextCursor || '');
+            resumePage = Number(meta?.page || resumePage || 0);
+            const t = now();
+            for (const p of pageProducts) {
+              const existed = latestIds.has(p.product_id);
+              latestIds.add(p.product_id);
+              if (!existed) fetchedTotal += 1;
+              upsertBasic.run(
+                accountId,
+                p.product_id,
+                p.name,
+                p.image,
+                p.price,
+                p.stock,
+                p.days_to_ship,
+                p.status,
+                p.is_pre_order ? 1 : 0,
+                '{}',
+                t,
+              );
+              if (p.product_id && !detailQueued.has(p.product_id)) {
+                detailQueued.add(p.product_id);
+                detailQueue.push(p.product_id);
+              }
+            }
+            addLog(accountId, 'products', `Saved page ${meta.page}/${meta.totalPages || '?'} to DB. current=${meta.fetchedCount}`);
+            if (taskId) {
+              updateTaskPayload(taskId, {
+                list_initialized: true,
+                resume_cursor: resumeCursor,
+                resume_page: resumePage,
+                fetched_count: fetchedTotal,
+                expected_total: expectedTotal,
+              });
+            }
+          },
+          {
+            startCursor: resumeCursor,
+            startPage: resumePage,
+            knownTotal: expectedTotal,
+            fetchedCount: fetchedTotal,
+          },
+        );
+        break;
+      } catch (e) {
+        const msg = e?.message || String(e);
+        if (!isRetriableError(msg)) {
+          addLog(accountId, 'products', `Fetch failed: ${msg}`, 'error');
+          throw e;
         }
-        addLog(accountId, 'products', `Saved page ${meta.page}/${meta.totalPages || '?'} to DB. current=${meta.fetchedCount}`);
-      },
-    );
-  } catch (e) {
-    const msg = e?.message || String(e);
-    addLog(accountId, 'products', `Fetch failed: ${msg}`, 'error');
-    throw e;
+        if (isRateLimitError(msg)) {
+          fetchAttempt += 1;
+          addLog(accountId, 'products', `Fetch failed (429): ${msg}`, 'error');
+          addLog(
+            accountId,
+            'products',
+            `Rate limit cooldown: wait ${Math.floor(FETCH_RESUME_INTERVAL_MS / 1000)}s then retry`,
+            'info',
+          );
+          await sleepWithStop(FETCH_RESUME_INTERVAL_MS);
+          continue;
+        }
+        if (isNetworkError(msg)) {
+          addLog(accountId, 'products', `Fetch failed (network): ${msg}`, 'error');
+          await waitForNetworkRecovery(accountId, 'products', acc.cookie_json);
+          addLog(accountId, 'products', 'Retry fetch immediately after network recovery', 'info');
+          continue;
+        }
+        fetchAttempt += 1;
+        addLog(accountId, 'products', `Fetch failed (retriable): ${msg}`, 'error');
+        addLog(
+          accountId,
+          'products',
+          `Auto resume ${fetchAttempt}: wait ${Math.floor(FETCH_RESUME_INTERVAL_MS / 1000)}s then retry fetch list`,
+          'info',
+        );
+        await sleepWithStop(FETCH_RESUME_INTERVAL_MS);
+      }
+    }
   } finally {
     listDone = true;
   }
@@ -233,9 +412,48 @@ async function executeFetchProducts(accountId) {
 
   addLog(accountId, 'products', `List phase finished. total=${fetchedTotal}`, 'success');
   await Promise.all(detailWorkers);
+  while (detailDeferred429.length > 0 || detailDeferredNet.length > 0) {
+    ensureNotStopped(accountId);
+    if (detailDeferredNet.length > 0) {
+      const pendingNet = detailDeferredNet.length;
+      addLog(accountId, 'products', `Detail deferred-net round: pending=${pendingNet}`, 'info');
+      await waitForNetworkRecovery(accountId, 'products', acc.cookie_json);
+      const roundNet = detailDeferredNet.splice(0, detailDeferredNet.length);
+      for (const pid of roundNet) {
+        ensureNotStopped(accountId);
+        const status = await processDetailItem(pid, 'deferred-net');
+        if (status === 'defer429') detailDeferred429.push(pid);
+        else if (status === 'deferNet') detailDeferredNet.push(pid);
+        await detailPaceSleep();
+      }
+      continue;
+    }
+    if (detailDeferred429.length === 0) continue;
+    const pending429 = detailDeferred429.length;
+    addLog(accountId, 'products', `Detail deferred-429 round: pending=${pending429}, wait 30s`, 'info');
+    await sleepWithStop(30000);
+    const round429 = detailDeferred429.splice(0, detailDeferred429.length);
+    for (const pid of round429) {
+      ensureNotStopped(accountId);
+      const status = await processDetailItem(pid, 'deferred-429');
+      if (status === 'defer429') detailDeferred429.push(pid);
+      else if (status === 'deferNet') detailDeferredNet.push(pid);
+      await detailPaceSleep();
+    }
+  }
   addLog(accountId, 'products', `Progress detail: ${detailDone}/${Math.max(expectedTotal, fetchedTotal, detailDone)} success=${detailOk} percent=100`);
   addLog(accountId, 'products', `Detail phase finished. success=${detailOk}, total=${Math.max(expectedTotal, fetchedTotal, detailDone)}`, 'success');
   addLog(accountId, 'products', `Fetch finished. total=${fetchedTotal}`, 'success');
+  if (taskId) {
+    updateTaskPayload(taskId, {
+      list_initialized: true,
+      resume_cursor: '',
+      resume_page: resumePage,
+      fetched_count: fetchedTotal,
+      expected_total: expectedTotal,
+      fetch_done: true,
+    });
+  }
   return true;
 }
 
@@ -292,51 +510,106 @@ async function executeDetailPhase(accountId, cookieJson, onlyPending = false) {
   let perfDbMs = 0;
   let perfTotalMs = 0;
   const detailDeferred429 = [];
+  const detailDeferredNet = [];
   const queue = latestList.map((x) => x.product_id);
+  const logDetailProgress = () => {
+    const percent = latestList.length > 0 ? Math.floor((detailDone / latestList.length) * 100) : 100;
+    addLog(accountId, 'products', `Progress detail: ${detailDone}/${latestList.length} success=${detailOk} percent=${percent}`);
+    if (detailDone > 0 && detailDone % 20 === 0) {
+      const denom = Math.max(detailOk, 1);
+      addLog(
+        accountId,
+        'products',
+        `Detail perf summary done=${detailDone} ok=${detailOk} avg_api=${Math.round(perfApiMs / denom)}ms avg_db=${Math.round(perfDbMs / denom)}ms avg_total=${Math.round(perfTotalMs / denom)}ms`,
+      );
+    }
+  };
+
+  const processDetailItem = async (productId, phaseLabel = 'main') => {
+    const tStart = Date.now();
+    try {
+      const tApiStart = Date.now();
+      const detail = await withRetry(
+        () => getProductInfo(cookieJson, productId, false),
+        DETAIL_RETRY,
+        (attempt, err) => addLog(accountId, 'products', `Detail retry ${attempt}/${DETAIL_RETRY}: ${productId} ${err?.message || err}`, 'error'),
+      );
+      const apiMs = Date.now() - tApiStart;
+      const dts = Number(detail?.pre_order_info?.days_to_ship ?? 0);
+      const isPre = detail?.pre_order_info?.pre_order ? 1 : 0;
+      const tDbStart = Date.now();
+      updateDetail.run(JSON.stringify(detail || {}), now(), dts, isPre, accountId, productId);
+      const dbMs = Date.now() - tDbStart;
+      const totalMs = Date.now() - tStart;
+      perfApiMs += apiMs;
+      perfDbMs += dbMs;
+      perfTotalMs += totalMs;
+      detailOk += 1;
+      detailDone += 1;
+      addLog(accountId, 'products', `Detail perf item=${productId} api=${apiMs}ms db=${dbMs}ms total=${totalMs}ms phase=${phaseLabel}`);
+      logDetailProgress();
+      return 'done';
+    } catch (e) {
+      const msg = String(e?.message || e || '');
+      if (isRateLimitError(msg)) {
+        addLog(accountId, 'products', `Detail defer429(${phaseLabel}): ${productId} ${msg}`, 'info');
+        return 'defer429';
+      }
+      if (isNetworkError(msg)) {
+        addLog(accountId, 'products', `Detail deferNet(${phaseLabel}): ${productId} ${msg}`, 'info');
+        return 'deferNet';
+      }
+      addLog(accountId, 'products', `Detail failed: ${productId} ${msg}`, 'error');
+      detailDone += 1;
+      logDetailProgress();
+      return 'failed';
+    }
+  };
+
   const worker = async () => {
     while (queue.length > 0) {
       ensureNotStopped(accountId);
       const productId = queue.shift();
       if (!productId) break;
-      const tStart = Date.now();
-      try {
-        const tApiStart = Date.now();
-        const detail = await withRetry(
-          () => getProductInfo(cookieJson, productId, false),
-          DETAIL_RETRY,
-          (attempt, err) => addLog(accountId, 'products', `Detail retry ${attempt}/${DETAIL_RETRY}: ${productId} ${err?.message || err}`, 'error'),
-        );
-        const apiMs = Date.now() - tApiStart;
-        const dts = Number(detail?.pre_order_info?.days_to_ship ?? 0);
-        const isPre = detail?.pre_order_info?.pre_order ? 1 : 0;
-        const tDbStart = Date.now();
-        updateDetail.run(JSON.stringify(detail || {}), now(), dts, isPre, accountId, productId);
-        const dbMs = Date.now() - tDbStart;
-        const totalMs = Date.now() - tStart;
-        perfApiMs += apiMs;
-        perfDbMs += dbMs;
-        perfTotalMs += totalMs;
-        detailOk += 1;
-        addLog(accountId, 'products', `Detail perf item=${productId} api=${apiMs}ms db=${dbMs}ms total=${totalMs}ms`);
-      } catch (e) {
-        addLog(accountId, 'products', `Detail failed: ${productId} ${e?.message || e}`, 'error');
-      } finally {
-        detailDone += 1;
-        const percent = latestList.length > 0 ? Math.floor((detailDone / latestList.length) * 100) : 100;
-        addLog(accountId, 'products', `Progress detail: ${detailDone}/${latestList.length} success=${detailOk} percent=${percent}`);
-        if (detailDone % 20 === 0) {
-          const denom = Math.max(detailOk, 1);
-          addLog(
-            accountId,
-            'products',
-            `Detail perf summary done=${detailDone} ok=${detailOk} avg_api=${Math.round(perfApiMs / denom)}ms avg_db=${Math.round(perfDbMs / denom)}ms avg_total=${Math.round(perfTotalMs / denom)}ms`,
-          );
-        }
+      const status = await processDetailItem(productId, 'main');
+      if (status === 'defer429') {
+        detailDeferred429.push(productId);
+      } else if (status === 'deferNet') {
+        detailDeferredNet.push(productId);
       }
       await detailPaceSleep();
     }
   };
   await Promise.all(Array.from({ length: DETAIL_WORKERS }, () => worker()));
+  while (detailDeferred429.length > 0 || detailDeferredNet.length > 0) {
+    ensureNotStopped(accountId);
+    if (detailDeferredNet.length > 0) {
+      const pendingNet = detailDeferredNet.length;
+      addLog(accountId, 'products', `Detail deferred-net round: pending=${pendingNet}`, 'info');
+      await waitForNetworkRecovery(accountId, 'products', cookieJson);
+      const roundNet = detailDeferredNet.splice(0, detailDeferredNet.length);
+      for (const pid of roundNet) {
+        ensureNotStopped(accountId);
+        const status = await processDetailItem(pid, 'deferred-net');
+        if (status === 'defer429') detailDeferred429.push(pid);
+        else if (status === 'deferNet') detailDeferredNet.push(pid);
+        await detailPaceSleep();
+      }
+      continue;
+    }
+    if (detailDeferred429.length === 0) continue;
+    const pending429 = detailDeferred429.length;
+    addLog(accountId, 'products', `Detail deferred-429 round: pending=${pending429}, wait 30s`, 'info');
+    await sleepWithStop(30000);
+    const round429 = detailDeferred429.splice(0, detailDeferred429.length);
+    for (const pid of round429) {
+      ensureNotStopped(accountId);
+      const status = await processDetailItem(pid, 'deferred-429');
+      if (status === 'defer429') detailDeferred429.push(pid);
+      else if (status === 'deferNet') detailDeferredNet.push(pid);
+      await detailPaceSleep();
+    }
+  }
   addLog(accountId, 'products', `Detail phase finished. success=${detailOk}, total=${latestList.length}`, 'success');
 }
 
@@ -349,6 +622,7 @@ async function executeBatchChange(accountId, days) {
   if (list.length === 0) throw new Error('No product in change list');
   let ok = 0; let fail = 0; let skip = 0; let done = 0;
   const deferred429 = [];
+  const deferredNet = [];
   addLog(accountId, 'change', `Batch start. total=${list.length}, days=${days}`);
   const startedAt = Date.now();
   const queue = [...list];
@@ -404,19 +678,26 @@ async function executeBatchChange(accountId, days) {
         err = e;
         const msg = String(e?.message || e || '');
         addLog(accountId, 'change', `Item ${p.product_id} attempt ${attempt}/3 failed: ${msg}`, 'error');
-        if (/HTTP 429/i.test(msg)) {
+        if (isRateLimitError(msg)) {
           const waitSec = attempt * 2;
           addLog(accountId, 'change', `Rate limited (429). wait ${waitSec}s then retry`, 'info');
           await sleepWithStop(waitSec * 1000);
+        } else if (isNetworkError(msg)) {
+          addLog(accountId, 'change', `Network error on item, defer to network queue`, 'info');
+          break;
         } else {
           if (attempt < 3) await randomSleep();
         }
       }
     }
 
-    if (/HTTP 429/i.test(String(err?.message || err || ''))) {
+    if (isRateLimitError(String(err?.message || err || ''))) {
       addLog(accountId, 'change', `Defer 429 item to tail queue: ${p.product_id} ${p.name}`, 'info');
       return 'defer429';
+    }
+    if (isNetworkError(String(err?.message || err || ''))) {
+      addLog(accountId, 'change', `Defer network item to tail queue: ${p.product_id} ${p.name}`, 'info');
+      return 'deferNet';
     }
 
     fail += 1;
@@ -431,26 +712,41 @@ async function executeBatchChange(accountId, days) {
       const p = queue.shift();
       if (!p) break;
       const status = await processOneItem(p, 'main');
-      if (status === 'defer429') {
-        deferred429.push(p);
-      }
+      if (status === 'defer429') deferred429.push(p);
+      if (status === 'deferNet') deferredNet.push(p);
       await randomSleep();
     }
   };
   await Promise.all(Array.from({ length: CHANGE_WORKERS }, () => worker()));
-  if (deferred429.length > 0) {
-    addLog(accountId, 'change', `Enter deferred-429 phase: pending=${deferred429.length}`, 'info');
+  if (deferred429.length > 0 || deferredNet.length > 0) {
+    addLog(accountId, 'change', `Enter deferred phase: pending429=${deferred429.length} pendingNet=${deferredNet.length}`, 'info');
   }
-  while (deferred429.length > 0) {
+  while (deferred429.length > 0 || deferredNet.length > 0) {
     ensureNotStopped(accountId);
-    addLog(accountId, 'change', `Deferred-429 round start: pending=${deferred429.length}. wait 30s`, 'info');
-    await sleepWithStop(30000);
-    const round = deferred429.splice(0, deferred429.length);
-    for (const p of round) {
-      ensureNotStopped(accountId);
-      const status = await processOneItem(p, 'deferred429');
-      if (status === 'defer429') deferred429.push(p);
-      await randomSleep();
+    if (deferredNet.length > 0) {
+      addLog(accountId, 'change', `Deferred-net round start: pending=${deferredNet.length}`, 'info');
+      await waitForNetworkRecovery(accountId, 'change', acc.cookie_json);
+      const roundNet = deferredNet.splice(0, deferredNet.length);
+      for (const p of roundNet) {
+        ensureNotStopped(accountId);
+        const status = await processOneItem(p, 'deferredNet');
+        if (status === 'defer429') deferred429.push(p);
+        if (status === 'deferNet') deferredNet.push(p);
+        await randomSleep();
+      }
+      continue;
+    }
+    if (deferred429.length > 0) {
+      addLog(accountId, 'change', `Deferred-429 round start: pending=${deferred429.length}. wait 30s`, 'info');
+      await sleepWithStop(30000);
+      const round429 = deferred429.splice(0, deferred429.length);
+      for (const p of round429) {
+        ensureNotStopped(accountId);
+        const status = await processOneItem(p, 'deferred429');
+        if (status === 'defer429') deferred429.push(p);
+        if (status === 'deferNet') deferredNet.push(p);
+        await randomSleep();
+      }
     }
   }
   addLog(accountId, 'change', `Batch finished. success=${ok}, skipped=${skip}, failed=${fail}`, 'success');
@@ -460,7 +756,7 @@ async function executeBatchChange(accountId, days) {
 async function runTaskWithRecord(accountId, taskType, payload, runner) {
   const taskId = createTask(accountId, taskType, payload);
   try {
-    const ret = await runner();
+    const ret = await runner(taskId);
     markTaskDone(taskId);
     return ret;
   } catch (e) {
@@ -472,18 +768,6 @@ async function runTaskWithRecord(accountId, taskType, payload, runner) {
 function resumeInterruptedTasks() {
   const RETRY_WINDOW_SEC = 24 * 60 * 60;
   const nowSec = now();
-  const isRetriableError = (msg) => {
-    const s = String(msg || '').toLowerCase();
-    if (!s) return false;
-    if (/task stopped by user/i.test(s)) return false;
-    return (
-      /http 429/.test(s)
-      || /rate limit/.test(s)
-      || /timeout|timed out|etimedout|econnreset|econnrefused|enotfound|eai_again|socket hang up/.test(s)
-      || /network|failed to fetch|fetch failed/.test(s)
-      || /request failed|gateway|bad gateway|service unavailable/.test(s)
-    );
-  };
 
   const tasks = db.prepare(
     "SELECT * FROM task_queue WHERE status = 'running' OR status = 'failed' ORDER BY id ASC",
@@ -508,12 +792,17 @@ function resumeInterruptedTasks() {
           if (!acc) throw new Error('Account not found');
           const latestCount = Number(db.prepare('SELECT COUNT(1) AS c FROM products WHERE account_id = ? AND exists_in_latest = 1').get(accountId)?.c || 0);
           const pendingCount = Number(db.prepare("SELECT COUNT(1) AS c FROM products WHERE account_id = ? AND exists_in_latest = 1 AND (detail_json IS NULL OR detail_json = '' OR detail_json = '{}')").get(accountId)?.c || 0);
-          if (latestCount > 0 && pendingCount > 0) {
+          const listFinished = hasListPhaseFinishedForTask(accountId, t);
+          if (listFinished && latestCount > 0 && pendingCount > 0) {
             addLog(accountId, 'products', `Resume strategy: continue detail phase only. pending=${pendingCount}/${latestCount}`, 'info');
             await executeDetailPhase(accountId, acc.cookie_json, true);
           } else {
-            addLog(accountId, 'products', 'Resume strategy: rerun full fetch flow', 'info');
-            await executeFetchProducts(accountId);
+            if (!listFinished) {
+              addLog(accountId, 'products', 'Resume strategy: list phase was not finished, rerun full fetch flow', 'info');
+            } else {
+              addLog(accountId, 'products', 'Resume strategy: rerun full fetch flow', 'info');
+            }
+            await executeFetchProducts(accountId, Number(t.id), payload);
           }
           markTaskDone(t.id);
         } catch (e) {
@@ -579,7 +868,7 @@ export function initHandlers() {
   });
 
   ipcMain.handle('products:fetch', (_e, accountId) => runExclusive(accountId, async () => (
-    runTaskWithRecord(accountId, 'products_fetch', {}, async () => executeFetchProducts(accountId))
+    runTaskWithRecord(accountId, 'products_fetch', { list_initialized: false, resume_cursor: '', resume_page: 0, fetched_count: 0, expected_total: 0, fetch_done: false }, async (taskId) => executeFetchProducts(accountId, taskId))
   )));
 
   ipcMain.handle('products:get', (_e, accountId) => db.prepare('SELECT * FROM products WHERE account_id = ? ORDER BY product_id DESC').all(accountId));

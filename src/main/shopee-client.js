@@ -95,15 +95,19 @@ export async function getShopInfo(cookieJSON) {
   return data.data;
 }
 
-export async function fetchAllProducts(cookieJSON, onProgress, onPage) {
+export async function fetchAllProducts(cookieJSON, onProgress, onPage, options = {}) {
   const c = parseCookieJSON(cookieJSON);
-  let cursor = '';
-  let page = 0;
+  let cursor = String(options?.startCursor || '');
+  let page = Number(options?.startPage || 0);
   const pageSize = 12;
   const seenCursors = new Set();
-  let totalProducts = 0;
+  let totalProducts = Number(options?.knownTotal || 0);
   let totalPages = 0;
-  let fetchedCount = 0;
+  let fetchedCount = Number(options?.fetchedCount || 0);
+
+  if (cursor) {
+    seenCursors.add(cursor);
+  }
 
   while (true) {
     page += 1;
@@ -136,9 +140,10 @@ export async function fetchAllProducts(cookieJSON, onProgress, onPage) {
     fetchedCount += normalizedList.length;
     const percent = totalProducts > 0 ? Math.min(100, Math.floor((fetchedCount / totalProducts) * 100)) : 0;
     onProgress?.(`Progress fetch: page=${page}/${totalPages || '?'} products=${fetchedCount}/${totalProducts || '?'} percent=${percent}`);
-    onPage?.(normalizedList, { page, totalPages, totalProducts, fetchedCount, percent });
+    const nextCursor = data.data?.next_cursor || data.data?.page_info?.cursor || '';
+    onPage?.(normalizedList, { page, totalPages, totalProducts, fetchedCount, percent, nextCursor });
 
-    cursor = data.data?.next_cursor || data.data?.page_info?.cursor || '';
+    cursor = nextCursor;
     if (cursor && seenCursors.has(cursor)) break;
     if (cursor) seenCursors.add(cursor);
     if (!cursor) break;
@@ -147,7 +152,7 @@ export async function fetchAllProducts(cookieJSON, onProgress, onPage) {
 
   if (fetchedCount > 0) return { totalProducts: fetchedCount };
   onProgress?.('search_product_list returned 0, fallback to get_product_list');
-  return fetchAllProductsFallback(c, onProgress, onPage);
+  return fetchAllProductsFallback(c, onProgress, onPage, { startPage: Number(options?.startPageNumber || 1), knownTotal: totalProducts, fetchedCount });
 }
 
 function normalizeProduct(p) {
@@ -164,7 +169,7 @@ function normalizeProduct(p) {
   };
 }
 
-async function fetchAllProductsFallback(c, onProgress, onPage) {
+async function fetchAllProductsFallback(c, onProgress, onPage, options = {}) {
   const listTypes = 'live_all,all,restock,review_listing_detail,improve_new_product,banned,deboosted,deleted,reviewing,delisted,draft';
   const countUrl = `${BASE}/api/v3/opt/mpsku/list/v2/get_list_count?SPC_CDS=${encodeURIComponent(c.SPC_CDS)}&SPC_CDS_VER=2&list_types=${encodeURIComponent(listTypes)}`;
   const countData = await request(c, 'GET', countUrl);
@@ -181,8 +186,11 @@ async function fetchAllProductsFallback(c, onProgress, onPage) {
 
   const pageSize = 20;
   const totalPage = Math.ceil(total / pageSize);
-  let fetchedCount = 0;
-  for (let pageNumber = 1; pageNumber <= totalPage; pageNumber += 1) {
+  let fetchedCount = Number(options?.fetchedCount || 0);
+  let startPage = Number(options?.startPage || 1);
+  if (!Number.isFinite(startPage) || startPage < 1) startPage = 1;
+  if (startPage > totalPage) startPage = totalPage;
+  for (let pageNumber = startPage; pageNumber <= totalPage; pageNumber += 1) {
     onProgress?.(`Fallback fetching page ${pageNumber}/${totalPage}`);
     const qs = new URLSearchParams({
       SPC_CDS: c.SPC_CDS,
@@ -206,7 +214,7 @@ async function fetchAllProductsFallback(c, onProgress, onPage) {
     fetchedCount += normalizedList.length;
     const percent = Math.min(100, Math.floor((pageNumber / totalPage) * 100));
     onProgress?.(`Progress fetch: page=${pageNumber}/${totalPage} products=${fetchedCount}/${total} percent=${percent}`);
-    onPage?.(normalizedList, { page: pageNumber, totalPages: totalPage, totalProducts: total, fetchedCount, percent });
+    onPage?.(normalizedList, { page: pageNumber, totalPages: totalPage, totalProducts: total, fetchedCount, percent, nextCursor: '' });
     await randomSleep();
   }
   return { totalProducts: fetchedCount };
