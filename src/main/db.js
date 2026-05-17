@@ -87,6 +87,48 @@ export async function initDB() {
       last_error TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS schedule_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      note TEXT DEFAULT '',
+      is_active INTEGER DEFAULT 0,
+      created_at INTEGER,
+      updated_at INTEGER,
+      last_run_at INTEGER,
+      last_result TEXT,
+      last_error TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS schedule_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      rule_type TEXT NOT NULL, -- daily / weekly
+      daily_time TEXT,          -- HH:mm
+      weekly_day INTEGER,       -- 0..6 (Sun..Sat)
+      weekly_time TEXT,         -- HH:mm
+      days_to_ship INTEGER NOT NULL,
+      next_run_at INTEGER,
+      created_at INTEGER,
+      updated_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS schedule_task_products (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      product_id INTEGER NOT NULL,
+      created_at INTEGER,
+      UNIQUE(task_id, product_id)
+    );
+    CREATE TABLE IF NOT EXISTS schedule_task_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      group_id INTEGER,
+      message TEXT,
+      type TEXT,
+      created_at INTEGER
+    );
+
     CREATE INDEX IF NOT EXISTS idx_products_account_change_list
       ON products(account_id, in_change_list);
     CREATE INDEX IF NOT EXISTS idx_products_account_latest
@@ -95,7 +137,66 @@ export async function initDB() {
       ON logs(account_id, tab, created_at);
     CREATE INDEX IF NOT EXISTS idx_task_queue_account_type_status_created
       ON task_queue(account_id, task_type, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_schedule_tasks_account_active
+      ON schedule_tasks(account_id, is_active, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_schedule_rules_task_next
+      ON schedule_rules(task_id, next_run_at);
+    CREATE INDEX IF NOT EXISTS idx_schedule_products_task
+      ON schedule_task_products(task_id);
+    CREATE INDEX IF NOT EXISTS idx_schedule_task_logs_task_created
+      ON schedule_task_logs(task_id, created_at);
   `);
+
+  // Migrate old schema: remove schedule_rules.is_active
+  const ruleCols = db.prepare("PRAGMA table_info(schedule_rules)").all();
+  const hasRuleActive = ruleCols.some((c) => String(c.name) === 'is_active');
+  if (hasRuleActive) {
+    db.exec(`
+      DROP INDEX IF EXISTS idx_schedule_rules_task_active_next;
+      CREATE TABLE IF NOT EXISTS schedule_rules_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL,
+        rule_type TEXT NOT NULL,
+        daily_time TEXT,
+        weekly_day INTEGER,
+        weekly_time TEXT,
+        days_to_ship INTEGER NOT NULL,
+        next_run_at INTEGER,
+        created_at INTEGER,
+        updated_at INTEGER
+      );
+      INSERT INTO schedule_rules_new (
+        id, task_id, rule_type, daily_time, weekly_day, weekly_time, days_to_ship, next_run_at, created_at, updated_at
+      )
+      SELECT
+        id, task_id, rule_type, daily_time, weekly_day, weekly_time, days_to_ship, next_run_at, created_at, updated_at
+      FROM schedule_rules;
+      DROP TABLE schedule_rules;
+      ALTER TABLE schedule_rules_new RENAME TO schedule_rules;
+      CREATE INDEX IF NOT EXISTS idx_schedule_rules_task_next
+        ON schedule_rules(task_id, next_run_at);
+    `);
+  }
+
+  const taskCols = db.prepare("PRAGMA table_info(schedule_tasks)").all();
+  const colSet = new Set(taskCols.map((c) => String(c.name)));
+  const ensureTaskCol = (name, ddl) => {
+    if (!colSet.has(name)) db.exec(`ALTER TABLE schedule_tasks ADD COLUMN ${ddl};`);
+  };
+  ensureTaskCol('run_status', 'run_status TEXT');
+  ensureTaskCol('run_total', 'run_total INTEGER DEFAULT 0');
+  ensureTaskCol('run_done', 'run_done INTEGER DEFAULT 0');
+  ensureTaskCol('run_success', 'run_success INTEGER DEFAULT 0');
+  ensureTaskCol('run_fail', 'run_fail INTEGER DEFAULT 0');
+  ensureTaskCol('run_skip', 'run_skip INTEGER DEFAULT 0');
+  ensureTaskCol('run_started_at', 'run_started_at INTEGER');
+  ensureTaskCol('run_updated_at', 'run_updated_at INTEGER');
+
+  const taskLogCols = db.prepare("PRAGMA table_info(schedule_task_logs)").all();
+  const hasTaskLogGroup = taskLogCols.some((c) => String(c.name) === 'group_id');
+  if (!hasTaskLogGroup) {
+    db.exec('ALTER TABLE schedule_task_logs ADD COLUMN group_id INTEGER;');
+  }
 }
 
 export const dbApi = {
