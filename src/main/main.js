@@ -5,6 +5,7 @@ import updaterPkg from 'electron-updater';
 import './preload.js';
 import { initHandlers } from './services.js';
 import { initDB } from './db.js';
+import { loadProxyConfig } from './proxy-config.js';
 const { autoUpdater } = updaterPkg;
 
 const __filename = fileURLToPath(import.meta.url);
@@ -157,16 +158,16 @@ function setupAutoUpdate(win) {
 function setupAppMenu(win) {
   const template = [
     {
-      label: 'Help',
+      label: '幫助',
       submenu: [
         {
-          label: 'Check for Updates',
+          label: '檢查更新',
           click: () => {
             if (isDev) {
               dialog.showMessageBox(win, {
                 type: 'info',
-                title: 'Check for Updates',
-                message: 'Dev mode does not check for updates.',
+                title: '檢查更新',
+                message: '開發模式不檢查更新。',
               }).catch(() => {});
               return;
             }
@@ -174,12 +175,18 @@ function setupAppMenu(win) {
           },
         },
         {
-          label: 'About',
+          label: '代理設定',
+          click: () => {
+            win.webContents.send('help:open-proxy-settings');
+          },
+        },
+        {
+          label: '關於',
           click: () => {
             dialog.showMessageBox(win, {
               type: 'info',
-              title: 'About',
-              message: `shopeeChangeDTS\nVersion ${app.getVersion()}`,
+              title: '關於',
+              message: `shopeeChangeDTS\n版本 ${app.getVersion()}`,
             }).catch(() => {});
           },
         },
@@ -204,6 +211,7 @@ app.on('second-instance', () => {
 app.whenReady().then(() => {
   return initDB();
 }).then(() => {
+  loadProxyConfig();
   initHandlers();
   mainWindow = createWindow();
   setupAppMenu(mainWindow);

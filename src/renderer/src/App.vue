@@ -420,6 +420,28 @@
         </section>
       </template>
     </main>
+    <div v-if="showProxySettings" class="picker-mask">
+      <div class="picker-card rule-card">
+        <h4>代理設定</h4>
+        <div class="schedule-form">
+          <label class="field">
+            <span class="field-label">啓用代理</span>
+            <select v-model="proxyEnabled">
+              <option :value="false">關閉</option>
+              <option :value="true">開啓</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">代理地址</span>
+            <input v-model.trim="proxyUrl" placeholder="http://127.0.0.1:7890" />
+          </label>
+        </div>
+        <div class="toolbar">
+          <button class="primary" @click="saveProxySettings">保存</button>
+          <button @click="closeProxySettings">取消</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -447,6 +469,7 @@ let noticeTimer = null;
 let logsTimer = null;
 let editBlurTimer = null;
 let cronTimer = null;
+let offOpenProxySettings = null;
 let refreshingProducts = false;
 let refreshingChangeList = false;
 let refreshingSchedules = false;
@@ -514,6 +537,9 @@ const scheduleTaskProductPageSize = ref(20);
 const scheduleTaskLogs = ref([]);
 const scheduleTaskLogGroups = ref([]);
 const scheduleTaskLogGroupId = ref('');
+const showProxySettings = ref(false);
+const proxyEnabled = ref(false);
+const proxyUrl = ref('');
 
 const filteredProducts = computed(() => {
   const keyword = productFilter.value.toLowerCase();
@@ -671,6 +697,28 @@ function showNotice(text, type = 'error') {
   notice.value = { text: String(text || ''), type };
   if (noticeTimer) clearTimeout(noticeTimer);
   noticeTimer = setTimeout(() => { notice.value = { text: '', type: 'error' }; }, 5000);
+}
+async function openProxySettings() {
+  try {
+    const cfg = await getApi().getProxySettings();
+    proxyEnabled.value = Boolean(cfg?.enabled);
+    proxyUrl.value = String(cfg?.url || '');
+    showProxySettings.value = true;
+  } catch (e) {
+    showNotice(getErrMsg(e), 'error');
+  }
+}
+function closeProxySettings() {
+  showProxySettings.value = false;
+}
+async function saveProxySettings() {
+  try {
+    await getApi().saveProxySettings({ enabled: proxyEnabled.value, url: proxyUrl.value });
+    showProxySettings.value = false;
+    showNotice('代理設定已保存', 'success');
+  } catch (e) {
+    showNotice(getErrMsg(e), 'error');
+  }
 }
 function isAccountRunning(accountId) {
   if (!accountId) return false;
@@ -1619,6 +1667,14 @@ onMounted(async () => {
         .finally(() => { refreshingSchedules = false; });
     }, 1000);
   }
+  try {
+    const api = getApi();
+    if (typeof api.onOpenProxySettings === 'function') {
+      offOpenProxySettings = api.onOpenProxySettings(() => {
+        openProxySettings().catch(() => {});
+      });
+    }
+  } catch {}
 });
 
 onBeforeUnmount(() => {
@@ -1629,6 +1685,10 @@ onBeforeUnmount(() => {
   if (cronTimer) {
     clearInterval(cronTimer);
     cronTimer = null;
+  }
+  if (offOpenProxySettings) {
+    offOpenProxySettings();
+    offOpenProxySettings = null;
   }
 });
 </script>

@@ -1,6 +1,7 @@
 ﻿import { ipcMain, BrowserWindow, dialog } from 'electron';
 import { dbApi as db } from './db.js';
 import { fetchAllProducts, getProductInfo, getShopInfo, randomSleep, updateDaysToShip } from './shopee-client.js';
+import { getProxyConfig, setProxyConfig } from './proxy-config.js';
 
 const running = new Set();
 const stopRequested = new Set();
@@ -1139,6 +1140,8 @@ function resumeInterruptedTasks() {
 }
 
 export function initHandlers() {
+  ipcMain.handle('proxy:get', () => getProxyConfig());
+  ipcMain.handle('proxy:set', (_e, payload = {}) => setProxyConfig(payload));
   ipcMain.handle('ui:confirm', async (e, opts = {}) => {
     const win = BrowserWindow.fromWebContents(e.sender) || BrowserWindow.getFocusedWindow() || undefined;
     const ret = await dialog.showMessageBox(win, {
@@ -1434,5 +1437,6 @@ export function initHandlers() {
   startLogCleanupScheduler();
   startScheduleTimer();
 }
+
 
 

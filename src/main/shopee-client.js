@@ -1,9 +1,13 @@
-﻿const FIXED_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.5911.4 Safari/537.36';
+﻿import { ProxyAgent } from 'undici';
+import { getProxyConfig } from './proxy-config.js';
+
+const FIXED_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.5911.4 Safari/537.36';
 const BASE = 'https://seller.shopee.tw';
 const DEFAULT_REFERER = 'https://seller.shopee.tw/portal/product/list/live/all?operationSortBy=recommend_v2';
 const DEFAULT_SC_FE_SESSION = '7E419DD0C34B6065';
 const DEFAULT_SC_FE_VER = '21.146464';
 let fetchFn = globalThis.fetch;
+const proxyAgentCache = new Map();
 
 async function ensureFetch() {
   if (fetchFn) return fetchFn;
@@ -75,11 +79,21 @@ async function request(cookieMap, method, url, body) {
 
   if (body) headers['Content-Type'] = 'application/json;charset=UTF-8';
 
-  const res = await doFetch(url, {
+  const reqOpts = {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
-  });
+  };
+  const p = getProxyConfig();
+  if (p.enabled && p.url) {
+    let agent = proxyAgentCache.get(p.url);
+    if (!agent) {
+      agent = new ProxyAgent(p.url);
+      proxyAgentCache.set(p.url, agent);
+    }
+    reqOpts.dispatcher = agent;
+  }
+  const res = await doFetch(url, reqOpts);
 
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
@@ -277,3 +291,4 @@ export async function updateDaysToShip(cookieJSON, productId, days, existingInfo
 }
 
 export { randomSleep };
+

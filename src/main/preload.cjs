@@ -28,6 +28,13 @@ contextBridge.exposeInMainWorld('api', {
   removeScheduleProducts: (taskId, productIds) => ipcRenderer.invoke('schedule:products:remove', taskId, productIds),
   getScheduleTaskLogs: (taskId, limit = 300, groupId = null) => ipcRenderer.invoke('schedule:task:logs:get', taskId, limit, groupId),
   getScheduleTaskLogGroups: (taskId) => ipcRenderer.invoke('schedule:task:log-groups', taskId),
+  getProxySettings: () => ipcRenderer.invoke('proxy:get'),
+  saveProxySettings: (payload) => ipcRenderer.invoke('proxy:set', payload),
+  onOpenProxySettings: (handler) => {
+    const fn = () => handler?.();
+    ipcRenderer.on('help:open-proxy-settings', fn);
+    return () => ipcRenderer.removeListener('help:open-proxy-settings', fn);
+  },
   confirmDialog: (opts) => ipcRenderer.invoke('ui:confirm', opts),
   getLogs: (accountId, tab, taskId = null) => ipcRenderer.invoke('logs:get', accountId, tab, taskId),
   getLogGroups: (accountId, tab) => ipcRenderer.invoke('logs:groups', accountId, tab),
